@@ -24,6 +24,12 @@ export async function getDb(): Promise<Db> {
   return client.db(dbName);
 }
 
+/** Release the process-owned pool for scripts and test teardown. */
+export async function closeDb(): Promise<void> {
+  await client.close();
+  connected = false;
+}
+
 /**
  * Runs `fn` inside a MongoDB multi-document transaction. Requires the cluster
  * to be a replica set (Atlas gives you this by default; a bare standalone

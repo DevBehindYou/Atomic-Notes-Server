@@ -1,3 +1,4 @@
+import { escapeRegex } from '../lib/validation';
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
@@ -44,7 +45,7 @@ admin.get('/user', async (c) => {
   if (!email) return c.json({ error: 'email is required' }, 400);
 
   const db = await getDb();
-  const user = await collections.users(db).findOne({ email: { $regex: `^${email}$`, $options: 'i' } });
+  const user = await collections.users(db).findOne({ email: { $regex: `^${escapeRegex(email)}$`, $options: 'i' } });
   if (!user) return c.json({ error: 'No user with that email' }, 404);
 
   const wallet = await collections.atomicUsers(db).findOne({ _id: user._id });
@@ -94,7 +95,7 @@ admin.post('/energy', async (c) => {
 
   let resolvedUserId = body.user_id;
   if (!resolvedUserId && body.email) {
-    const user = await collections.users(db).findOne({ email: { $regex: `^${body.email}$`, $options: 'i' } });
+    const user = await collections.users(db).findOne({ email: { $regex: `^${escapeRegex(body.email)}$`, $options: 'i' } });
     if (!user) return c.json({ error: 'user not found' }, 404);
     resolvedUserId = user._id;
   }
@@ -213,7 +214,7 @@ admin.post('/notifications', async (c) => {
 
   let targetUserId = body.target_user_id ?? null;
   if (!targetUserId && body.target_email) {
-    const user = await collections.users(db).findOne({ email: { $regex: `^${body.target_email}$`, $options: 'i' } });
+    const user = await collections.users(db).findOne({ email: { $regex: `^${escapeRegex(body.target_email)}$`, $options: 'i' } });
     if (!user) return c.json({ error: 'target user not found' }, 404);
     targetUserId = user._id;
   }

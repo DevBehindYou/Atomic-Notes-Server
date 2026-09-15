@@ -272,6 +272,8 @@ export async function ensureIndexes(db: Db) {
   await collections.sessions(db).createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }); // TTL cleanup
   await collections.energyLedger(db).createIndex({ userId: 1, createdAt: -1 });
   await collections.notes(db).createIndex({ userId: 1, deleted: 1 });
+  await collections.notes(db).createIndex({ userId: 1, updatedAt: 1 });
+  await collections.sessions(db).createIndex({ userId: 1, createdAt: -1 });
   await collections.folders(db).createIndex({ userId: 1 });
   await collections.logs(db).createIndex({ userId: 1, createdAt: -1 });
   await collections.notifications(db).createIndex({ status: 1, createdAt: -1 });

@@ -4,9 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/dev.ts",
+    "dev": "node --env-file-if-exists=.env --import tsx --watch src/dev.ts",
     "build": "tsc",
-    "db:indexes": "tsx src/scripts/ensureIndexes.ts"
+    "db:indexes": "node --env-file-if-exists=.env --import tsx src/scripts/ensureIndexes.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "test": "node --import tsx --test tests/unit.test.ts",
+    "test:integration": "node --import tsx --test tests/integration.test.ts"
   },
   "dependencies": {
     "hono": "^4.6.0",

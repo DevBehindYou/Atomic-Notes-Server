@@ -1,3 +1,4 @@
+import { energyEnsure } from '../lib/energy';
 import { Hono } from 'hono';
 import { z } from 'zod';
 import crypto, { randomUUID } from 'node:crypto';
@@ -86,6 +87,7 @@ async function completeGoogleLogin(
     );
   }
 
+  await energyEnsure(db, user._id);
   const sessionToken = await createSession(db, user._id, userAgent);
   await logEvent(db, 'login', { userId: user._id, meta: { via: existingAccount ? 'google_return' : 'google_first' } });
 

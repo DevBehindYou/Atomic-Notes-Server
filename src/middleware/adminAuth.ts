@@ -19,7 +19,7 @@ export async function requireAdmin(c: Context, next: Next) {
   if (!expected) {
     return c.json({ error: 'admin_api_not_configured' }, 500);
   }
-  if (!key || key.length !== expected.length || !timingSafeEqual(Buffer.from(key), Buffer.from(expected))) {
+  if (!key || Buffer.byteLength(key) !== Buffer.byteLength(expected) || !timingSafeEqual(Buffer.from(key), Buffer.from(expected))) {
     return c.json({ error: 'unauthorized' }, 401);
   }
   return next();

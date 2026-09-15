@@ -1,5 +1,10 @@
 # Atomic Notes Server
 
+**Current readiness:** see [VERIFICATION.md](VERIFICATION.md) for the September
+15 review, confirmed fixes, remaining release blockers and the new GitHub
+Actions database/API suite. The historical migration notes below describe
+implementation intent; they are not evidence of end-to-end verification.
+
 Node.js + TypeScript + Hono backend for Atomic Notes, on MongoDB. Replaces
 Supabase: Google Drive holds each user's actual note content (per the
 migration brief's ownership principle), MongoDB holds everything else —

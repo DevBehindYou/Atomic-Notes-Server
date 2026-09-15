@@ -1,3 +1,4 @@
+import { energyEnsure } from '../lib/energy';
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { getDb } from '../db/mongo';
@@ -29,22 +30,8 @@ atomicuser.patch('/', async (c) => {
   const userId = c.get('userId') as string;
   const { username } = updateSchema.parse(await c.req.json());
   const db = await getDb();
-  await collections.atomicUsers(db).updateOne(
-    { _id: userId },
-    {
-      $set: { username },
-      $setOnInsert: {
-        noteLimit: 20,
-        coins: 5, // welcome gift, new wallets only — see lib/energy.ts
-        energy: 0,
-        energyCap: 120,
-        lastDailyGrantAt: null,
-        lastStandardSyncAt: null,
-        createdAt: new Date(),
-      },
-    },
-    { upsert: true },
-  );
+  await energyEnsure(db, userId);
+  await collections.atomicUsers(db).updateOne({ _id: userId }, { $set: { username } });
   return c.json({ ok: true, username });
 });
 

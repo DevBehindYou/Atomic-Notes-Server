@@ -17,7 +17,7 @@ publicRoute.get('/notifications/active', async (c) => {
   const now = new Date();
   const rows = await collections
     .notifications(db)
-    .find({ status: 'active', $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }] })
+    .find({ status: 'active', targetAudience: 'all', targetUserId: null, $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }] })
     .sort({ createdAt: -1 })
     .toArray();
 

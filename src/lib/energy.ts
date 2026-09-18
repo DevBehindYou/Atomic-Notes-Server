@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Db } from 'mongodb';
-import { collections, type AtomicUserDoc } from '../db/collections';
-import { withTransaction } from '../db/mongo';
+import { collections, type AtomicUserDoc } from '../db/collections.js';
+import { withTransaction } from '../db/mongo.js';
 
 /**
  * Ported from the real Postgres SQL (supabase/migrations/006_energy.sql,

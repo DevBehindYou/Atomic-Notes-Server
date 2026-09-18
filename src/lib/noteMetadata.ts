@@ -1,7 +1,7 @@
 import type { Db } from 'mongodb';
-import { collections, type NoteDoc } from '../db/collections';
-import { withTransaction } from '../db/mongo';
-import { syncOperations } from './syncOperation';
+import { collections, type NoteDoc } from '../db/collections.js';
+import { withTransaction } from '../db/mongo.js';
+import { syncOperations } from './syncOperation.js';
 
 /**
  * Commit a monotonic per-user sync sequence with each metadata mutation.

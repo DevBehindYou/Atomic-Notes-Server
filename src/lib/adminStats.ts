@@ -1,5 +1,5 @@
 import type { Db } from 'mongodb';
-import { collections } from '../db/collections';
+import { collections } from '../db/collections.js';
 
 /**
  * Direct port of supabase/migrations/011_controller_stats.sql's

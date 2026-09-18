@@ -1,10 +1,10 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
-import { getDb } from '../db/mongo';
-import { collections } from '../db/collections';
-import { requireAuth } from '../middleware/auth';
-import { logEvent } from '../lib/logs';
+import { getDb } from '../db/mongo.js';
+import { collections } from '../db/collections.js';
+import { requireAuth } from '../middleware/auth.js';
+import { logEvent } from '../lib/logs.js';
 
 // IMPORTANT: this file does not, and should not, ever see a recovery phrase
 // or a derived key. In the live app (lib/security/vault.dart), the phrase

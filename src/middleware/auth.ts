@@ -1,6 +1,6 @@
 import type { Context, Next } from 'hono';
-import { getDb } from '../db/mongo';
-import { verifySession } from '../lib/session';
+import { getDb } from '../db/mongo.js';
+import { verifySession } from '../lib/session.js';
 
 // Session-based, not JWT-based: the token is opaque and looked up in
 // MongoDB on every request. This is the point of "store the client session

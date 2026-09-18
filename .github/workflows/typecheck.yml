@@ -34,6 +34,11 @@ jobs:
         run: npm audit --audit-level=high
       - name: Build
         run: npm run build
+      - name: Load compiled entrypoint under plain Node ESM (what Vercel runs)
+        env:
+          MONGODB_URI: mongodb://127.0.0.1:27017
+        run: |
+          node --input-type=module -e "const m = await import('./dist/api/index.js'); const r = await m.default.fetch(new Request('https://localhost/api/health')); if (r.status !== 200) throw new Error('health returned ' + r.status); console.log('compiled entrypoint ok'); process.exit(0)"
       - name: Unit tests
         run: npm test
       - name: Start disposable MongoDB replica set

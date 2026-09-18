@@ -1,19 +1,19 @@
-import { energyEnsure } from '../lib/energy';
+import { energyEnsure } from '../lib/energy.js';
 import { Hono } from 'hono';
 import { z } from 'zod';
 import crypto, { randomUUID } from 'node:crypto';
 import type { Db } from 'mongodb';
 import type { Credentials } from 'google-auth-library';
-import { getDb, withTransaction } from '../db/mongo';
-import { acquireOperationLock } from '../lib/operationLock';
+import { getDb, withTransaction } from '../db/mongo.js';
+import { acquireOperationLock } from '../lib/operationLock.js';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
-import { collections } from '../db/collections';
-import { getAuthUrl, getOAuthClient, getOAuthClientForServerAuthCode } from '../lib/googleOAuth';
-import { ensureAppFolders } from '../lib/googleDrive';
-import { encryptToken, decryptToken } from '../lib/crypto';
-import { createSession, revokeSession } from '../lib/session';
-import { logEvent } from '../lib/logs';
-import { requireAuth } from '../middleware/auth';
+import { collections } from '../db/collections.js';
+import { getAuthUrl, getOAuthClient, getOAuthClientForServerAuthCode } from '../lib/googleOAuth.js';
+import { ensureAppFolders } from '../lib/googleDrive.js';
+import { encryptToken, decryptToken } from '../lib/crypto.js';
+import { createSession, revokeSession } from '../lib/session.js';
+import { logEvent } from '../lib/logs.js';
+import { requireAuth } from '../middleware/auth.js';
 
 const auth = new Hono();
 

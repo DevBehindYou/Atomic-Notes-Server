@@ -1,20 +1,20 @@
-import { saveNoteMetadata } from '../lib/noteMetadata';
-import { beginSync, finishSync, findSync, recordSyncResult, settleAbandonedSyncs, type SyncOperation } from '../lib/syncOperation';
-import { ENERGY } from '../lib/energy';
-import { acquireOperationLock } from '../lib/operationLock';
-import { NOTE_LIMITS, refineNoteContent, remoteNoteRowSchema } from '../types/noteWire';
-import { mapConcurrent } from '../lib/concurrency';
+import { saveNoteMetadata } from '../lib/noteMetadata.js';
+import { beginSync, finishSync, findSync, recordSyncResult, settleAbandonedSyncs, type SyncOperation } from '../lib/syncOperation.js';
+import { ENERGY } from '../lib/energy.js';
+import { acquireOperationLock } from '../lib/operationLock.js';
+import { NOTE_LIMITS, refineNoteContent, remoteNoteRowSchema } from '../types/noteWire.js';
+import { mapConcurrent } from '../lib/concurrency.js';
 import { Hono, type Context } from 'hono';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
-import { getDb } from '../db/mongo';
-import { collections, type NoteDoc } from '../db/collections';
-import { requireAuth } from '../middleware/auth';
-import { decryptToken, encryptToken } from '../lib/crypto';
-import { createNoteFile, updateNoteFile, deleteNoteFile, getNoteFileContent } from '../lib/googleDrive';
-import { refreshAccessToken } from '../lib/googleOAuth';
-import { todoItemSchema, migrateAtomicFile } from '../types/atomicFile';
-import { logEvent } from '../lib/logs';
+import { getDb } from '../db/mongo.js';
+import { collections, type NoteDoc } from '../db/collections.js';
+import { requireAuth } from '../middleware/auth.js';
+import { decryptToken, encryptToken } from '../lib/crypto.js';
+import { createNoteFile, updateNoteFile, deleteNoteFile, getNoteFileContent } from '../lib/googleDrive.js';
+import { refreshAccessToken } from '../lib/googleOAuth.js';
+import { todoItemSchema, migrateAtomicFile } from '../types/atomicFile.js';
+import { logEvent } from '../lib/logs.js';
 
 export function createNotesRoute(drive = { createNoteFile, updateNoteFile, deleteNoteFile, getNoteFileContent }) {
   const { createNoteFile, updateNoteFile, deleteNoteFile, getNoteFileContent } = drive;

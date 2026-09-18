@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { todoItemSchema } from './atomicFile';
+import { todoItemSchema } from './atomicFile.js';
 
 /** Bounds shared by batch sync and the direct note endpoints. */
 export const NOTE_LIMITS = { title: 300, body: 131072, payload: 196608, wireBytes: 250000 } as const;

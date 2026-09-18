@@ -1,9 +1,9 @@
-import { energyEnsure } from '../lib/energy';
+import { energyEnsure } from '../lib/energy.js';
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { getDb } from '../db/mongo';
-import { collections } from '../db/collections';
-import { requireAuth } from '../middleware/auth';
+import { getDb } from '../db/mongo.js';
+import { collections } from '../db/collections.js';
+import { requireAuth } from '../middleware/auth.js';
 
 const atomicuser = new Hono();
 atomicuser.use('*', requireAuth);

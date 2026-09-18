@@ -1,6 +1,6 @@
 import { randomBytes, createHash } from 'node:crypto';
 import type { Db } from 'mongodb';
-import { collections } from '../db/collections';
+import { collections } from '../db/collections.js';
 
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 

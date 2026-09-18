@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Db } from 'mongodb';
-import { collections } from '../db/collections';
+import { collections } from '../db/collections.js';
 
 export async function logEvent(
   db: Db,

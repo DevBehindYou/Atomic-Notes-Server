@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { mapConcurrent } from '../src/lib/concurrency';
@@ -138,4 +140,24 @@ test('configuration issues name variables without exposing values', () => {
   assert.doesNotThrow(() => assertProductionEnvironment({ ...bad, VERCEL_ENV: 'preview' } as NodeJS.ProcessEnv));
   assert.throws(() => assertProductionEnvironment({ ...bad, VERCEL_ENV: 'production' } as NodeJS.ProcessEnv), /TOKEN_ENCRYPTION_KEY/);
   assert.throws(() => assertProductionEnvironment({ ...bad, NODE_ENV: 'production' } as NodeJS.ProcessEnv), (error: Error) => !error.message.includes(secret));
+});
+
+test('relative imports name .js files so the compiled output runs under plain Node ESM', () => {
+  // tsx (used by these tests) forgives extensionless imports; the compiled output on Vercel does not.
+  const offenders: string[] = [];
+  const specifier = /(?:\bfrom\s+|^\s*import\s+|\bimport\s*\(\s*)(['"])(\.{1,2}\/[^'"]*)\1/gm;
+  const scan = (file: string) => {
+    for (const match of readFileSync(file, 'utf8').matchAll(specifier)) {
+      if (!/\.(js|mjs|cjs|json)$/.test(match[2])) offenders.push(`${file}: ${match[2]}`);
+    }
+  };
+  const walk = (dir: string) => {
+    for (const name of readdirSync(dir)) {
+      const path = join(dir, name);
+      if (statSync(path).isDirectory()) walk(path);
+      else if (path.endsWith('.ts') && !path.endsWith('.d.ts')) scan(path);
+    }
+  };
+  walk('src'); walk('api');
+  assert.deepEqual(offenders, []);
 });

@@ -1,13 +1,13 @@
-import { escapeRegex } from '../lib/validation';
+import { escapeRegex } from '../lib/validation.js';
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
-import { getDb, withTransaction } from '../db/mongo';
-import { collections, type NotificationDoc } from '../db/collections';
-import { requireAdmin } from '../middleware/adminAuth';
-import { computeControllerStats } from '../lib/adminStats';
-import { logEvent } from '../lib/logs';
-import { getEnvIssues } from '../lib/env';
+import { getDb, withTransaction } from '../db/mongo.js';
+import { collections, type NotificationDoc } from '../db/collections.js';
+import { requireAdmin } from '../middleware/adminAuth.js';
+import { computeControllerStats } from '../lib/adminStats.js';
+import { logEvent } from '../lib/logs.js';
+import { getEnvIssues } from '../lib/env.js';
 
 const admin = new Hono();
 admin.use('*', requireAdmin);

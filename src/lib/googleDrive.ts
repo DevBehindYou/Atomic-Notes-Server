@@ -1,6 +1,6 @@
 import { Readable } from 'node:stream';
 import { google, drive_v3 } from 'googleapis';
-import { getOAuthClient } from './googleOAuth';
+import { getOAuthClient } from './googleOAuth.js';
 
 const APP_FOLDER_NAME = 'My-Atomic-Notes';
 

@@ -1,5 +1,5 @@
-import { getDb } from '../db/mongo';
-import { ensureIndexes } from '../db/collections';
+import { getDb } from '../db/mongo.js';
+import { ensureIndexes } from '../db/collections.js';
 
 const db = await getDb();
 await ensureIndexes(db);

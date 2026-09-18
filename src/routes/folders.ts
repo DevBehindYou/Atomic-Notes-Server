@@ -1,8 +1,8 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { getDb } from '../db/mongo';
-import { collections } from '../db/collections';
-import { requireAuth } from '../middleware/auth';
+import { getDb } from '../db/mongo.js';
+import { collections } from '../db/collections.js';
+import { requireAuth } from '../middleware/auth.js';
 
 const foldersRoute = new Hono();
 foldersRoute.use('*', requireAuth);

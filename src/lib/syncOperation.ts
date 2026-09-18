@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Db } from 'mongodb';
-import { collections } from '../db/collections';
-import { withTransaction } from '../db/mongo';
-import { ENERGY, EnergyError, energyEnsure, energyGrantDaily } from './energy';
+import { collections } from '../db/collections.js';
+import { withTransaction } from '../db/mongo.js';
+import { ENERGY, EnergyError, energyEnsure, energyGrantDaily } from './energy.js';
 
 export type SyncResult = { id: string; ok: boolean; updated_at?: string; error?: string; version?: number };
 export type SyncOperation = {

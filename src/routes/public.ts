@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
-import { getDb } from '../db/mongo';
-import { collections } from '../db/collections';
+import { getDb } from '../db/mongo.js';
+import { collections } from '../db/collections.js';
 
 const publicRoute = new Hono();
 

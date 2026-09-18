@@ -12,15 +12,18 @@
     "test:integration": "node --import tsx --test tests/integration.test.ts"
   },
   "dependencies": {
+    "googleapis": "150.0.1",
     "hono": "^4.6.0",
-    "googleapis": "^144.0.0",
     "mongodb": "^6.10.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@hono/node-server": "^1.13.0",
+    "@types/node": "^22.7.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.6.0",
-    "@types/node": "^22.7.0"
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": "22.x"
   }
 }

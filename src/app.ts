@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import { cors } from 'hono/cors';
 import authRoute from './routes/auth';
 import notesRoute from './routes/notes';
@@ -11,11 +12,12 @@ import publicRoute from './routes/public';
 import { registerErrorHandler } from './middleware/errorHandler';
 
 const app = new Hono().basePath('/api');
+app.use('*', bodyLimit({ maxSize: 4 * 1024 * 1024, onError: (c) => c.json({ error: 'request_too_large' }, 413) }));
 
 app.use(
   '*',
   cors({
-    origin: process.env.ALLOWED_ORIGIN?.split(',') ?? '*',
+    origin: process.env.ALLOWED_ORIGIN?.split(',').map((origin) => origin.trim()).filter(Boolean) ?? [],
   }),
 );
 

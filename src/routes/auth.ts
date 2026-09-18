@@ -3,12 +3,14 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import crypto, { randomUUID } from 'node:crypto';
 import type { Db } from 'mongodb';
-import type { Credentials, OAuth2Client } from 'google-auth-library';
-import { getDb } from '../db/mongo';
+import type { Credentials } from 'google-auth-library';
+import { getDb, withTransaction } from '../db/mongo';
+import { acquireOperationLock } from '../lib/operationLock';
+import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import { collections } from '../db/collections';
 import { getAuthUrl, getOAuthClient, getOAuthClientForServerAuthCode } from '../lib/googleOAuth';
 import { ensureAppFolders } from '../lib/googleDrive';
-import { encryptToken } from '../lib/crypto';
+import { encryptToken, decryptToken } from '../lib/crypto';
 import { createSession, revokeSession } from '../lib/session';
 import { logEvent } from '../lib/logs';
 import { requireAuth } from '../middleware/auth';
@@ -22,76 +24,44 @@ const auth = new Hono();
  * identical, so it lives once here instead of twice, with the two routes
  * differing only in how they get to this point.
  */
-async function completeGoogleLogin(
-  db: Db,
-  client: OAuth2Client,
-  tokens: Credentials,
-  userAgent: string | null | undefined,
+export async function completeGoogleLogin(
+  db: Db, client: Pick<ReturnType<typeof getOAuthClient>, 'verifyIdToken'>, tokens: Credentials,
+  userAgent: string | null | undefined, setupFolders = ensureAppFolders,
 ) {
-  if (!tokens.access_token || !tokens.refresh_token || !tokens.id_token) {
-    return {
-      error: 'incomplete_token_response' as const,
-      hint:
-        'Missing refresh_token almost always means the user already granted consent once before. ' +
-        'The web flow sends prompt=consent to avoid this on first login; the mobile flow needs ' +
-        '`google_sign_in` configured with forceCodeForRefreshToken: true. Either way, if it still ' +
-        'happens, have the user revoke access at https://myaccount.google.com/permissions and retry.',
-    };
-  }
-
+  if (!tokens.access_token || !tokens.id_token) return { error: 'incomplete_token_response' as const };
   const ticket = await client.verifyIdToken({ idToken: tokens.id_token, audience: process.env.GOOGLE_CLIENT_ID! });
   const payload = ticket.getPayload();
-  if (!payload?.email || !payload.sub) return { error: 'invalid_id_token' as const };
-
+  if (!payload?.email || !payload.sub || payload.email_verified !== true) return { error: 'invalid_id_token' as const };
   const googleAccountId = payload.sub;
-  const email = payload.email;
-  const now = new Date();
-
-  let user = await collections.users(db).findOne({ email });
-  if (!user) {
-    user = { _id: randomUUID(), email, displayName: payload.name ?? null, createdAt: now, updatedAt: now };
-    await collections.users(db).insertOne(user);
-  }
-
-  const tokenExpiry = new Date(tokens.expiry_date ?? Date.now() + 3600_000);
-  const existingAccount = await collections.googleAccounts(db).findOne({ googleAccountId });
-
-  if (existingAccount) {
-    await collections.googleAccounts(db).updateOne(
-      { googleAccountId },
-      {
-        $set: {
-          encryptedAccessToken: encryptToken(tokens.access_token),
-          encryptedRefreshToken: encryptToken(tokens.refresh_token),
-          tokenExpiry,
-        },
-      },
-    );
-  } else {
-    await collections.googleAccounts(db).insertOne({
-      _id: randomUUID(),
-      userId: user._id,
-      googleAccountId,
-      encryptedAccessToken: encryptToken(tokens.access_token),
-      encryptedRefreshToken: encryptToken(tokens.refresh_token),
-      tokenExpiry,
-      driveRootFolderId: null,
-      createdAt: now,
+  const release = await acquireOperationLock(db, `google:${googleAccountId}`);
+  try {
+    const existing = await collections.googleAccounts(db).findOne({ googleAccountId });
+    const refreshToken = tokens.refresh_token || (existing ? decryptToken(existing.encryptedRefreshToken) : null);
+    if (!refreshToken) return { error: 'refresh_token_required' as const, hint: 'Grant offline Drive access, then sign in again.' };
+    const now = new Date();
+    const email = payload.email.toLowerCase();
+    const userId = existing?.userId ?? randomUUID();
+    await withTransaction(async (session) => {
+      // Link by Google's stable subject, never by an email that might change owners.
+      await collections.users(db).updateOne({ _id: userId }, {
+        $set: { email, displayName: payload.name ?? null, updatedAt: now },
+        $setOnInsert: { createdAt: now },
+      }, { upsert: true, session });
+      await collections.googleAccounts(db).updateOne({ googleAccountId }, {
+        $set: { encryptedAccessToken: encryptToken(tokens.access_token!), encryptedRefreshToken: encryptToken(refreshToken),
+          tokenExpiry: new Date(tokens.expiry_date ?? Date.now() + 3600000) },
+        $setOnInsert: { _id: randomUUID(), userId, googleAccountId, driveRootFolderId: null, createdAt: now },
+      }, { upsert: true, session });
     });
-
-    // Only set up the Drive folder structure on first connect, not every login.
-    const folderIds = await ensureAppFolders(tokens.access_token, tokens.refresh_token);
-    await collections.googleAccounts(db).updateOne(
-      { googleAccountId },
-      { $set: { driveRootFolderId: folderIds.notesId } },
-    );
-  }
-
-  await energyEnsure(db, user._id);
-  const sessionToken = await createSession(db, user._id, userAgent);
-  await logEvent(db, 'login', { userId: user._id, meta: { via: existingAccount ? 'google_return' : 'google_first' } });
-
-  return { token: sessionToken, user: { id: user._id, email: user.email } };
+    if (!existing?.driveRootFolderId) {
+      const folders = await setupFolders(tokens.access_token, refreshToken);
+      await collections.googleAccounts(db).updateOne({ googleAccountId, userId }, { $set: { driveRootFolderId: folders.notesId } });
+    }
+    await energyEnsure(db, userId);
+    const token = await createSession(db, userId, userAgent);
+    await logEvent(db, 'login', { userId, meta: { via: existing ? 'google_return' : 'google_first' } });
+    return { token, user: { id: userId, email } };
+  } finally { await release(); }
 }
 
 // ---------------------------------------------------------------------------
@@ -100,18 +70,29 @@ async function completeGoogleLogin(
 // OAuth flow inside a mobile app means a webview or custom-tab plus deep
 // link handling, real friction native sign-in avoids entirely.
 // ---------------------------------------------------------------------------
-auth.get('/google', (c) => {
-  const state = crypto.randomBytes(16).toString('hex');
-  // TODO before production: persist `state` and verify it on /callback —
-  // CSRF protection on the OAuth flow, not optional at launch.
+const stateHash = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
+const stateCookie = 'atomic_oauth_state';
+auth.get('/google', async (c) => {
+  const state = crypto.randomBytes(32).toString('base64url');
+  const binding = crypto.randomBytes(32).toString('base64url');
+  const db = await getDb();
+  await db.collection<{ _id: string; binding: string; expiresAt: Date }>('oauth_states').insertOne({
+    _id: stateHash(state), binding: stateHash(binding), expiresAt: new Date(Date.now() + 600000),
+  });
+  setCookie(c, stateCookie, binding, { httpOnly: true, secure: new URL(c.req.url).protocol === 'https:',
+    sameSite: 'Lax', path: '/api/auth', maxAge: 600 });
   return c.redirect(getAuthUrl(state));
 });
 
 auth.get('/callback', async (c) => {
-  const code = c.req.query('code');
-  if (!code) return c.json({ error: 'missing_code' }, 400);
-
+  const code = c.req.query('code'), state = c.req.query('state'), binding = getCookie(c, stateCookie);
+  deleteCookie(c, stateCookie, { path: '/api/auth' });
+  if (!code || !state || !binding) return c.json({ error: 'invalid_oauth_state' }, 400);
   const db = await getDb();
+  const pending = await db.collection<{ _id: string; binding: string; expiresAt: Date }>('oauth_states').findOneAndDelete({
+    _id: stateHash(state), binding: stateHash(binding), expiresAt: { $gt: new Date() },
+  });
+  if (!pending) return c.json({ error: 'invalid_oauth_state' }, 400);
   const client = getOAuthClient();
   const { tokens } = await client.getToken(code);
 

@@ -1,6 +1,10 @@
-import { remoteNoteRowSchema } from '../types/noteWire';
+import { saveNoteMetadata } from '../lib/noteMetadata';
+import { beginSync, finishSync, findSync, recordSyncResult, settleAbandonedSyncs, type SyncOperation } from '../lib/syncOperation';
+import { ENERGY } from '../lib/energy';
+import { acquireOperationLock } from '../lib/operationLock';
+import { NOTE_LIMITS, refineNoteContent, remoteNoteRowSchema } from '../types/noteWire';
 import { mapConcurrent } from '../lib/concurrency';
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import { getDb } from '../db/mongo';
@@ -16,22 +20,44 @@ export function createNotesRoute(drive = { createNoteFile, updateNoteFile, delet
   const { createNoteFile, updateNoteFile, deleteNoteFile, getNoteFileContent } = drive;
   const notesRoute = new Hono();
   notesRoute.use('*', requireAuth);
+  notesRoute.use('*', async (c, next) => {
+    // Keep pulls and writes consistent with one another across Vercel instances.
+    const release = await acquireOperationLock(await getDb(), `notes:${c.get('userId')}`, 15000);
+    try {
+      if (!['GET', 'HEAD'].includes(c.req.method) && !c.req.path.endsWith('/push')) {
+        const db = await getDb();
+        // The lock is ours, so an operation still pending belongs to a request that died.
+        await settleAbandonedSyncs(db, c.get('userId'));
+        if (['POST', 'PATCH'].includes(c.req.method)) {
+          const wallet = await collections.atomicUsers(db).findOne({ _id: c.get('userId') });
+          if (!wallet?.lastStandardSyncAt || Date.now() - wallet.lastStandardSyncAt.getTime() >= ENERGY.standardSyncFreeWindowMs) {
+            return c.json({ error: 'sync_payment_required', hint: 'Use /notes/push for automatic charging.' }, 409);
+          }
+        }
+      }
+      await next();
+    } finally { await release(); }
+  });
 
   // Field names match the real `note` table (kind/title/body/items/pinned/
   // enc_v/payload) — content (title/body/items, or payload when encrypted)
   // goes to Drive; everything else is metadata and stays in Mongo. See
   // db/collections.ts's noteSchema comment for the full Supabase-column ->
   // Mongo-field mapping.
-  const writeNoteSchema = z.object({
+  const noteFields = z.object({
     kind: z.enum(['text', 'todo']).default('text'),
-    title: z.string().max(300).default(''),
-    body: z.string().default(''),
+    title: z.string().max(NOTE_LIMITS.title).default(''),
+    body: z.string().max(NOTE_LIMITS.body).default(''),
     items: z.array(todoItemSchema).default([]),
     pinned: z.boolean().default(false),
-    encV: z.number().int().default(0),
-    payload: z.string().nullable().default(null),
+    encV: z.union([z.literal(0), z.literal(1)]).default(0),
+    payload: z.string().max(NOTE_LIMITS.payload).nullable().default(null),
     folderId: z.string().uuid().optional(),
   });
+  const writeNoteSchema = noteFields.superRefine(refineNoteContent);
+  // A PATCH must name the version it edited, so it cannot silently overwrite a newer one.
+  const patchNoteSchema = noteFields.partial().extend({ base_version: z.number().int().nonnegative() });
+  const mergedContentGuard = z.custom<Parameters<typeof refineNoteContent>[0]>().superRefine(refineNoteContent);
 
   /** Loads this user's Google tokens, refreshing the access token first if it's about to expire. */
   async function getLiveGoogleTokens(db: Awaited<ReturnType<typeof getDb>>, userId: string) {
@@ -124,7 +150,7 @@ export function createNotesRoute(drive = { createNoteFile, updateNoteFile, delet
       updatedAt: now,
       lastSyncedAt: now,
     };
-    await collections.notes(db).insertOne(note);
+    await saveNoteMetadata(db, userId, noteId, {}, note);
     return c.json(note, 201);
   });
 
@@ -132,19 +158,20 @@ export function createNotesRoute(drive = { createNoteFile, updateNoteFile, delet
     const userId = c.get('userId') as string;
     const id = c.req.param('id');
     const db = await getDb();
-    const body = writeNoteSchema.partial().parse(await c.req.json());
+    const body = patchNoteSchema.parse(await c.req.json());
 
-    const existing = await collections.notes(db).findOne({ _id: id, userId });
+    // A deleted note is gone for this endpoint; reviving one goes through /push.
+    const existing = await collections.notes(db).findOne({ _id: id, userId, deleted: false });
     if (!existing) return c.json({ error: 'not_found' }, 404);
+    if (body.base_version !== existing.localVersion) {
+      return c.json({ error: 'note_conflict', version: existing.localVersion }, 409);
+    }
 
     const { accessToken, refreshToken } = await getLiveGoogleTokens(db, userId);
 
-    // NOTE: writes straight through (last-write-wins) — see driveRevisionId/
-    // localVersion in db/collections.ts for the fields a real conflict check
-    // would compare; not wired in yet, same caveat as the rest of this backend.
     const previous = migrateAtomicFile(await getNoteFileContent(accessToken, refreshToken, existing.driveFileId));
-    const driveFile = await updateNoteFile(accessToken, refreshToken, existing.driveFileId, {
-      version: 1,
+    const next = {
+      version: 1 as const,
       id: existing._id,
       kind: body.kind ?? existing.kind,
       title: body.title ?? previous.title,
@@ -155,24 +182,16 @@ export function createNotesRoute(drive = { createNoteFile, updateNoteFile, delet
       payload: body.payload === undefined ? previous.payload : body.payload,
       createdAt: existing.createdAt.toISOString(),
       updatedAt: new Date().toISOString(),
-    });
+    };
+    mergedContentGuard.parse(next);
+    const driveFile = await updateNoteFile(accessToken, refreshToken, existing.driveFileId, next);
 
     const now = new Date();
-    await collections.notes(db).updateOne(
-      { _id: id, userId },
-      {
-        $set: {
-          kind: body.kind ?? existing.kind,
-          pinned: body.pinned ?? existing.pinned,
-          encV: body.encV ?? existing.encV,
-          driveRevisionId: driveFile.headRevisionId ?? existing.driveRevisionId,
-          updatedAt: now,
-          lastSyncedAt: now,
-        },
-        $inc: { localVersion: 1 },
-      },
-    );
-    const updated = await collections.notes(db).findOne({ _id: id, userId });
+    const updated = await saveNoteMetadata(db, userId, id, {
+      kind: body.kind ?? existing.kind, pinned: body.pinned ?? existing.pinned,
+      encV: body.encV ?? existing.encV, driveRevisionId: driveFile.headRevisionId ?? existing.driveRevisionId,
+      updatedAt: now, lastSyncedAt: now,
+    });
     return c.json(updated);
   });
 
@@ -185,7 +204,7 @@ export function createNotesRoute(drive = { createNoteFile, updateNoteFile, delet
 
     const { accessToken, refreshToken } = await getLiveGoogleTokens(db, userId);
     await deleteNoteFile(accessToken, refreshToken, existing.driveFileId);
-    await collections.notes(db).updateOne({ _id: id, userId }, { $set: { deleted: true, updatedAt: new Date() } });
+    await saveNoteMetadata(db, userId, id, { deleted: true, updatedAt: new Date() });
     await logEvent(db, 'note_deleted', { userId, meta: { noteId: id } });
     return c.json({ ok: true });
   });
@@ -200,11 +219,12 @@ export function createNotesRoute(drive = { createNoteFile, updateNoteFile, delet
   // omitted from the wire shape below; it's implied by the session, never
   // trusted from the client.
   // ---------------------------------------------------------------------------
-  type RemoteNoteRow = z.infer<typeof remoteNoteRowSchema> & { updated_at: string };
+  type RemoteNoteRow = Omit<z.infer<typeof remoteNoteRowSchema>, 'base_version'> & { updated_at: string; version: number };
 
   function toWireRow(m: NoteDoc, content: { title: string; body: string; items: unknown[]; payload: string | null }): RemoteNoteRow {
     return {
       id: m._id,
+      version: m.localVersion,
       kind: m.kind,
       title: content.title,
       body: content.body,
@@ -218,14 +238,27 @@ export function createNotesRoute(drive = { createNoteFile, updateNoteFile, delet
     };
   }
 
+  /** The response for a closed operation, identical for the original request and every retry. */
+  function pushResponse(c: Context, operation: SyncOperation) {
+    const { results, charged, refunded } = operation;
+    // The App reads per-row results from a 502 and keeps failed notes dirty.
+    if (results.some((r) => !r.ok)) return c.json({ error: 'note_sync_failed', ok: false, results, charged, refunded }, 502);
+    return c.json({ ok: true, results, charged, refunded });
+  }
+
   notesRoute.post('/push', async (c) => {
     const userId = c.get('userId') as string;
     const db = await getDb();
-    const { rows } = z.object({ rows: z.array(remoteNoteRowSchema) }).parse(await c.req.json());
+    const { rows, requestId, mode } = z.object({ rows: z.array(remoteNoteRowSchema).max(20), requestId: z.string().uuid(), mode: z.enum(['standard', 'instant']).default('standard') }).parse(await c.req.json());
     if (rows.length === 0) return c.json({ ok: true, results: [] });
     if (new Set(rows.map((row) => row.id)).size !== rows.length) {
       return c.json({ error: 'duplicate_note_ids' }, 400);
     }
+    // A finished request is answered from its record before any check that depends on
+    // current state (quota, Google tokens): those must not block recovery of a delivered sync.
+    const recorded = await findSync(db, userId, requestId, rows, mode);
+    if (recorded?.status === 'complete') return pushResponse(c, recorded);
+
     // Reject collisions before touching Drive; also scope every write below.
     const collision = await collections.notes(db).findOne({
       _id: { $in: rows.map((row) => row.id) }, userId: { $ne: userId },
@@ -243,12 +276,18 @@ export function createNotesRoute(drive = { createNoteFile, updateNoteFile, delet
     if (limitError) return c.json(limitError, 409);
 
     const { accessToken, refreshToken, driveFolderId } = await getLiveGoogleTokens(db, userId);
-    const results: Array<{ id: string; ok: boolean; updated_at?: string; error?: string }> = [];
+    const operation = recorded ?? await beginSync(db, userId, requestId, rows, mode);
+    const decided = new Set(operation.results.map((result) => result.id));
 
     for (const row of rows) {
+      if (decided.has(row.id)) continue;
       try {
         const now = new Date();
         const existing = existingById.get(row.id);
+        if (existing && row.base_version !== existing.localVersion) {
+          await recordSyncResult(db, operation, { id: row.id, ok: false, error: 'note_conflict', version: existing.localVersion });
+          continue;
+        }
         const driveContent = {
           version: 1 as const,
           id: row.id,
@@ -288,39 +327,34 @@ export function createNotesRoute(drive = { createNoteFile, updateNoteFile, delet
           lastSyncedAt: new Date(),
           syncStatus: 'synced' as const,
         };
-        await collections.notes(db).updateOne(
-          { _id: row.id, userId },
-          existing
-            ? { $set: setFields, $inc: { localVersion: 1 } }
-            : {
-                $set: setFields,
-                $setOnInsert: { _id: row.id, folderId: null, createdAt: new Date(row.created_at), localVersion: 1 },
-              },
-          { upsert: true },
-        );
-
-        results.push({ id: row.id, ok: true, updated_at: setFields.updatedAt.toISOString() });
+        // Stores the success result in the same transaction as the metadata.
+        await saveNoteMetadata(db, userId, row.id, setFields, existing ? undefined : {
+          _id: row.id, ...setFields, folderId: null, createdAt: new Date(row.created_at), localVersion: 1,
+        }, operation._id);
       } catch (e) {
-        results.push({ id: row.id, ok: false, error: e instanceof Error ? e.message : 'unknown_error' });
+        // Message only: Google client errors can carry request headers with bearer tokens.
+        console.error('note_write_failed', row.id, e instanceof Error ? e.message : 'unknown');
+        // A no-op when the commit did succeed but its response was lost: stored success wins.
+        await recordSyncResult(db, operation, { id: row.id, ok: false, error: 'note_write_failed' });
       }
     }
+    const completed = await finishSync(db, operation);
 
-    await logEvent(db, 'notes_pushed', { userId, meta: { count: rows.length, failed: results.filter((r) => !r.ok).length } });
-    if (results.some((r) => !r.ok)) {
-      // The current App only checks HTTP status before clearing dirty notes.
-      return c.json({ error: 'note_sync_failed', ok: false, results }, 502);
-    }
-    return c.json({ ok: true, results });
+    await logEvent(db, 'notes_pushed', { userId, meta: { count: rows.length, failed: completed.results.filter((r) => !r.ok).length } });
+    return pushResponse(c, completed);
   });
 
   notesRoute.get('/pull', async (c) => {
     const userId = c.get('userId') as string;
     const db = await getDb();
     const since = c.req.query('since');
+    const afterValue = c.req.query('after');
+    const after = afterValue === undefined ? null : z.coerce.number().int().nonnegative().parse(afterValue);
     const encOnly = c.req.query('encOnly') === 'true';
 
     const filter: Record<string, unknown> = { userId };
-    if (since) {
+    if (after !== null) filter.syncSequence = { $gt: after };
+    else if (since) {
       // Retain compatibility with older App requests that omit a timezone.
       const parsed = new Date(since);
       if (!Number.isFinite(parsed.getTime())) return c.json({ error: 'invalid_since' }, 400);
@@ -329,8 +363,12 @@ export function createNotesRoute(drive = { createNoteFile, updateNoteFile, delet
     if (encOnly) filter.encV = 0;
 
     const cursor = new Date().toISOString();
-    const metaRows = await collections.notes(db).find(filter).toArray();
-    if (metaRows.length === 0) return c.json({ rows: [], cursor });
+    const metaRows = await collections.notes(db).find(filter).sort({ syncSequence: 1, _id: 1 }).limit(11).toArray();
+    const hasMore = metaRows.length > 10;
+    if (hasMore) metaRows.pop();
+    const latest = await db.collection<{ _id: string; value: number }>('sync_counters').findOne({ _id: userId });
+    const nextCursor = hasMore ? metaRows[metaRows.length - 1].syncSequence ?? 0 : latest?.value ?? 0;
+    if (metaRows.length === 0) return c.json({ rows: [], cursor, nextCursor, hasMore: false });
 
     // Tombstones carry no content — skip the Drive read for those, the row
     // already tells the client everything it needs (delete it locally).
@@ -350,7 +388,7 @@ export function createNotesRoute(drive = { createNoteFile, updateNoteFile, delet
         return toWireRow(m, { title: content.title, body: content.body, items: content.items, payload: content.payload });
       });
 
-    return c.json({ rows, cursor });
+    return c.json({ rows, cursor, nextCursor, hasMore });
   });
 
   /** Hard-deletes everything (not just tombstones) — mirrors the live app's wipeRemote(), used on account/vault reset. */
@@ -363,7 +401,9 @@ export function createNotesRoute(drive = { createNoteFile, updateNoteFile, delet
       const { accessToken, refreshToken } = await getLiveGoogleTokens(db, userId);
       await mapConcurrent(all, 4, (n) => deleteNoteFile(accessToken, refreshToken, n.driveFileId));
     }
-    await collections.notes(db).deleteMany({ userId });
+    for (const note of all) {
+      await saveNoteMetadata(db, userId, note._id, { deleted: true, updatedAt: new Date() });
+    }
     await logEvent(db, 'notes_wiped', { userId, meta: { count: all.length } });
     return c.json({ ok: true, deleted: all.length });
   });

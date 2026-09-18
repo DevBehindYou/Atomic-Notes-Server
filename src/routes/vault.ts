@@ -55,7 +55,8 @@ vault.post('/', async (c) => {
   const existing = await collections.vaults(db).findOne({ _id: userId });
   if (existing) return c.json({ error: 'vault_already_exists' }, 409);
 
-  await collections.vaults(db).insertOne({
+  try {
+    await collections.vaults(db).insertOne({
     _id: userId,
     verifier: body.verifier,
     kdf: 'argon2id',
@@ -65,6 +66,11 @@ vault.post('/', async (c) => {
     encV: 1,
     createdAt: new Date(),
   });
+
+  } catch (error) {
+    if ((error as { code?: number }).code === 11000) return c.json({ error: 'vault_already_exists' }, 409);
+    throw error;
+  }
 
   await logEvent(db, 'vault_created', { userId });
   return c.json({ ok: true }, 201);

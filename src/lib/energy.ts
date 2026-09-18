@@ -35,6 +35,7 @@ export const ENERGY = {
 } as const;
 
 export class EnergyError extends Error {
+  readonly status = 409;
   code: 'insufficient_coins' | 'insufficient_energy' | 'energy_cap_exceeded' | 'invalid_amount';
   constructor(code: EnergyError['code']) {
     super(code);

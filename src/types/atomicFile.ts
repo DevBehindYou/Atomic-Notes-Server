@@ -8,7 +8,10 @@ import { z } from 'zod';
 // the actual ciphertext (see lib/security/vault.dart's seal/open). Missing
 // payload/encV here was a real bug in this scaffold's first pass: an
 // encrypted note would have round-tripped as empty content, silently.
-export const todoItemSchema = z.object({ text: z.string(), done: z.boolean() });
+export const todoItemSchema = z.union([
+  z.object({ text: z.string(), done: z.boolean() }),
+  z.object({ t: z.string(), d: z.boolean() }).transform(({ t, d }) => ({ text: t, done: d })),
+]);
 
 export const atomicFileV1Schema = z.object({
   version: z.literal(1),

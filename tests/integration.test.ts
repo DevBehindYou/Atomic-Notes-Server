@@ -26,7 +26,11 @@ const { default: publicRoute } = await import('../src/routes/public');
 const { default: vault } = await import('../src/routes/vault');
 const { default: energyRoute } = await import('../src/routes/energy');
 const { default: profileRoute } = await import('../src/routes/atomicuser');
-const { default: auth } = await import('../src/routes/auth');
+const { default: auth, completeGoogleLogin } = await import('../src/routes/auth');
+const { beginSync, recordSyncResult, syncOperations } = await import('../src/lib/syncOperation');
+const { saveNoteMetadata } = await import('../src/lib/noteMetadata');
+const { decryptToken } = await import('../src/lib/crypto');
+const { remoteNoteRowSchema } = await import('../src/types/noteWire');
 
 test('Server contracts with a real MongoDB replica set and a fake Drive adapter', { timeout: 120000 }, async (t) => {
   const db = await getDb();
@@ -80,7 +84,7 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
   const row = (overrides = {}) => ({ id: randomUUID(), kind: 'text', title: 'Keep title', body: 'Keep body', items: [],
     pinned: false, deleted: false, created_at: new Date().toISOString(),
     enc_v: 0, payload: null, ...overrides });
-  const push = (rows: object[], token = owner.token) => request('/notes/push', 'POST', { rows }, token);
+  const push = (rows: object[], token = owner.token, requestId = randomUUID(), mode = 'standard') => request('/notes/push', 'POST', { rows, requestId, mode }, token);
 
   await t.test('owner isolation, partial updates and failed pushes', async () => {
     const original = row(); assert.equal((await push([original])).status, 200);
@@ -89,7 +93,7 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
     assert.equal(writes, before);
     assert.equal((await collections.notes(db).findOne({ _id: original.id }))!.userId, owner.id);
     assert.equal((await push([original, original])).status, 400);
-    assert.equal((await request(`/notes/${original.id}`, 'PATCH', { pinned: true }, owner.token)).status, 200);
+    assert.equal((await request(`/notes/${original.id}`, 'PATCH', { pinned: true, base_version: 1 }, owner.token)).status, 200);
     const metadata = (await collections.notes(db).findOne({ _id: original.id }))!;
     assert.equal(files.get(metadata.driveFileId).body, 'Keep body');
     assert.equal(files.get(metadata.driveFileId).title, 'Keep title');
@@ -178,5 +182,220 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
     assert.equal((await request('/auth/logout', 'POST', undefined, account.token)).status, 200);
     assert.equal(await verifySession(db, account.token), null);
     assert.equal((await request('/vault', 'GET', undefined, account.token)).status, 401);
+  });
+
+  const wallet = async (id: string) => (await collections.atomicUsers(db).findOne({ _id: id }))!;
+  const json = async (response: Response) => await response.json() as any;
+  const refundCount = (id: string) => collections.energyLedger(db).countDocuments({ userId: id, note: /^Refund/ });
+
+  await t.test('a finished request is replayed from its record even when quota and Google state changed', async () => {
+    const account = await user(), requestId = randomUUID(), rows = [row()];
+    const first = await push(rows, account.token, requestId);
+    assert.equal(first.status, 200);
+    const firstBody = await json(first);
+    assert.equal(firstBody.charged, 5);
+    const energy = (await wallet(account.id)).energy, before = writes;
+    await collections.atomicUsers(db).updateOne({ _id: account.id }, { $set: { noteLimit: 0 } });
+    await collections.googleAccounts(db).deleteOne({ userId: account.id });
+    const second = await push(rows, account.token, requestId);
+    assert.equal(second.status, 200);
+    assert.deepEqual(await json(second), firstBody);
+    assert.equal(writes, before);
+    assert.equal((await wallet(account.id)).energy, energy);
+    assert.equal((await push([{ ...rows[0], title: 'changed' }], account.token, requestId)).status, 409);
+  });
+
+  await t.test('concurrent duplicates of one request charge and write once', async () => {
+    const account = await user(), requestId = randomUUID(), rows = [row()], before = writes;
+    const [a, b] = await Promise.all([push(rows, account.token, requestId), push(rows, account.token, requestId)]);
+    assert.deepEqual([a.status, b.status], [200, 200]);
+    assert.deepEqual(await json(a), await json(b));
+    assert.equal(writes, before + 1);
+    assert.equal((await wallet(account.id)).energy, 15);
+    assert.equal(await collections.energyLedger(db).countDocuments({ userId: account.id, kind: 'spend' }), 1);
+  });
+
+  await t.test('a batch where every note fails is refunded once and restores the free window', async () => {
+    const account = await user(), requestId = randomUUID(), rows = [row({ title: 'FAIL' }), row({ title: 'FAIL' })];
+    failTitle = 'FAIL';
+    try {
+      const first = await push(rows, account.token, requestId);
+      assert.equal(first.status, 502);
+      const body = await json(first);
+      assert.deepEqual(body.results.map((r: any) => r.ok), [false, false]);
+      assert.deepEqual([body.charged, body.refunded], [5, 5]);
+      const after = await wallet(account.id);
+      assert.equal(after.energy, 20);
+      assert.equal(after.lastStandardSyncAt, null);
+      assert.equal(await refundCount(account.id), 1);
+      const again = await push(rows, account.token, requestId);
+      assert.equal(again.status, 502);
+      assert.deepEqual(await json(again), body);
+      assert.equal((await wallet(account.id)).energy, 20);
+      assert.equal(await refundCount(account.id), 1);
+    } finally { failTitle = ''; }
+  });
+
+  await t.test('a partly successful batch keeps its charge', async () => {
+    const account = await user();
+    failTitle = 'FAIL';
+    try {
+      const response = await push([row({ title: 'fine' }), row({ title: 'FAIL' })], account.token);
+      assert.equal(response.status, 502);
+      const body = await json(response);
+      assert.deepEqual([body.charged, body.refunded], [5, 0]);
+      assert.equal((await wallet(account.id)).energy, 15);
+      assert.equal(await refundCount(account.id), 0);
+    } finally { failTitle = ''; }
+  });
+
+  await t.test('version conflicts are reported per note, not overwritten, and resolve with the current version', async () => {
+    const account = await user(), note = row();
+    const created = await json(await push([note], account.token));
+    assert.equal(created.results[0].version, 1);
+    const stale = await push([{ ...note, title: 'stale', base_version: 0 }], account.token);
+    assert.equal(stale.status, 502);
+    const staleBody = await json(stale);
+    assert.equal(staleBody.results[0].error, 'note_conflict');
+    assert.equal(staleBody.results[0].version, 1);
+    const stored = (await collections.notes(db).findOne({ _id: note.id }))!;
+    assert.equal(files.get(stored.driveFileId).title, 'Keep title');
+    const fresh = await json(await push([{ ...note, title: 'fresh', base_version: 1 }], account.token));
+    assert.equal(fresh.results[0].version, 2);
+    assert.equal(files.get(stored.driveFileId).title, 'fresh');
+  });
+
+  await t.test('direct PATCH requires the edited version and refuses deleted or invalid notes', async () => {
+    const account = await user(), note = row();
+    assert.equal((await push([note], account.token)).status, 200);
+    const patch = (body: object) => request(`/notes/${note.id}`, 'PATCH', body, account.token);
+    assert.equal((await patch({ pinned: true })).status, 400);
+    const conflict = await patch({ pinned: true, base_version: 0 });
+    assert.equal(conflict.status, 409);
+    assert.equal((await json(conflict)).version, 1);
+    assert.equal((await patch({ pinned: true, base_version: 1 })).status, 200);
+    assert.equal((await patch({ body: 'x'.repeat(131073), base_version: 2 })).status, 400);
+    assert.equal((await patch({ encV: 1, base_version: 2 })).status, 400);
+    assert.equal((await push([{ ...note, deleted: true, base_version: 2 }], account.token)).status, 200);
+    assert.equal((await patch({ pinned: false, base_version: 3 })).status, 404);
+  });
+
+  await t.test('pull pages by sequence cursor and reports deletions after the cursor', async () => {
+    const account = await user(), notes = Array.from({ length: 12 }, () => row());
+    assert.equal((await push(notes, account.token)).status, 200);
+    const pull = async (query = '') => json(await request(`/notes/pull${query}`, 'GET', undefined, account.token));
+    const first = await pull();
+    assert.equal(first.rows.length, 10); assert.equal(first.hasMore, true);
+    const second = await pull(`?after=${first.nextCursor}`);
+    assert.equal(second.rows.length, 2); assert.equal(second.hasMore, false);
+    assert.deepEqual([...first.rows, ...second.rows].map((r: any) => r.id), notes.map((n) => n.id));
+    const third = await pull(`?after=${second.nextCursor}`);
+    assert.deepEqual([third.rows.length, third.hasMore, third.nextCursor], [0, false, second.nextCursor]);
+    assert.equal((await push([{ ...notes[0], deleted: true, base_version: 1 }], account.token)).status, 200);
+    const fourth = await pull(`?after=${third.nextCursor}`);
+    assert.deepEqual(fourth.rows.map((r: any) => [r.id, r.deleted]), [[notes[0].id, true]]);
+  });
+
+  await t.test('concurrent creates cannot exceed the note quota', async () => {
+    const account = await user();
+    await collections.atomicUsers(db).updateOne({ _id: account.id }, { $set: { noteLimit: 1 } });
+    const responses = await Promise.all([push([row()], account.token), push([row()], account.token)]);
+    assert.deepEqual(responses.map((r) => r.status).sort(), [200, 409]);
+    assert.equal(await collections.notes(db).countDocuments({ userId: account.id, deleted: false }), 1);
+  });
+
+  await t.test('concurrent vault creation returns one 201 and one 409', async () => {
+    const account = await user(), body = { verifier: 'v', kdfMemory: 65536, kdfIterations: 3, kdfParallelism: 1 };
+    const statuses = (await Promise.all([request('/vault', 'POST', body, account.token), request('/vault', 'POST', body, account.token)])).map((r) => r.status);
+    assert.deepEqual(statuses.sort(), [201, 409]);
+  });
+
+  await t.test('operations abandoned by a dead request are settled from stored results, never guessed', async () => {
+    const account = await user();
+    // 1) Nothing committed: the charge is refunded and the next request proceeds.
+    const lost = [row(), row()], lostId = randomUUID();
+    // The route fingerprints zod-parsed rows, so a later retry through HTTP must match these.
+    const parse = (rows: object[]) => rows.map((r) => remoteNoteRowSchema.parse(r));
+    const lostOp = await beginSync(db, account.id, lostId, parse(lost), 'standard');
+    assert.equal(lostOp.charged, 5); assert.equal((await wallet(account.id)).energy, 15);
+    const next = await push([row()], account.token);
+    assert.equal(next.status, 200);
+    const settled = (await syncOperations(db).findOne({ _id: lostOp._id }))!;
+    assert.equal(settled.status, 'complete');
+    assert.deepEqual(settled.results.map((r) => r.error), ['note_write_interrupted', 'note_write_interrupted']);
+    assert.equal(settled.refunded, 5);
+    assert.equal(await refundCount(account.id), 1);
+    assert.equal((await wallet(account.id)).energy, 15); // refunded 5, charged 5 for the new request
+    assert.equal((await push(lost, account.token, lostId)).status, 502); // a late retry sees the recorded outcome
+
+    // 2) One note committed before the crash: no refund, and a recorded failure cannot override the stored success.
+    const committed = row(), missing = row(), partialId = randomUUID();
+    await collections.atomicUsers(db).updateOne({ _id: account.id }, { $set: { energy: 100 } });
+    const partial = await beginSync(db, account.id, partialId, parse([committed, missing]), 'instant');
+    const fields = { userId: account.id, kind: 'text' as const, pinned: false, deleted: false, encV: 0 as const, driveFileId: 'file-x', driveRevisionId: null,
+      updatedAt: new Date(), lastSyncedAt: new Date(), syncStatus: 'synced' as const };
+    await saveNoteMetadata(db, account.id, committed.id, fields, { _id: committed.id, ...fields, folderId: null, createdAt: new Date(), localVersion: 1 }, partial._id);
+    await recordSyncResult(db, partial, { id: committed.id, ok: false, error: 'note_write_failed' });
+    const energyBefore = (await wallet(account.id)).energy;
+    assert.equal((await request('/notes/count', 'GET', undefined, account.token)).status, 200); // GET does not settle
+    assert.equal((await syncOperations(db).findOne({ _id: partial._id }))!.status, 'pending');
+    assert.equal((await push([row()], account.token, randomUUID(), 'instant')).status, 200); // a new push does
+    const outcome = (await syncOperations(db).findOne({ _id: partial._id }))!;
+    assert.deepEqual(outcome.results.map((r) => [r.id, r.ok]), [[committed.id, true], [missing.id, false]]);
+    assert.equal(outcome.refunded, 0);
+    assert.equal((await wallet(account.id)).energy, energyBefore - 10); // only the new instant push was charged
+
+    // 3) A closed operation refuses further commits, so a late request cannot write unaccounted metadata.
+    const late = row();
+    await assert.rejects(saveNoteMetadata(db, account.id, late.id, fields, { _id: late.id, ...fields, folderId: null, createdAt: new Date(), localVersion: 1 }, partial._id), /sync_operation_closed/);
+    assert.equal(await collections.notes(db).findOne({ _id: late.id }), null);
+  });
+
+  await t.test('returning Google login links by subject, reuses the refresh token and repairs missing Drive setup', async () => {
+    const sub = randomUUID();
+    const verifier = { async verifyIdToken({ idToken }: { idToken: string }) { return { getPayload: () => JSON.parse(idToken) }; } } as any;
+    const login = (claims: object, tokens: object = {}, setup: any = async () => ({ notesId: 'folder-1' })) => completeGoogleLogin(db, verifier, {
+      access_token: 'access', refresh_token: 'refresh-1', expiry_date: Date.now() + 3600000,
+      id_token: JSON.stringify({ sub, email: 'Person@Example.com', email_verified: true, name: 'Person', ...claims }), ...tokens }, 'test-agent', setup);
+
+    await assert.rejects(login({}, {}, async () => { throw new Error('drive_setup_failed'); }), /drive_setup_failed/);
+    let account = (await collections.googleAccounts(db).findOne({ googleAccountId: sub }))!;
+    assert.equal(account.driveRootFolderId, null);
+
+    const returning = await login({ email: 'Moved@Example.com' }, { refresh_token: undefined, access_token: 'access-2' }, async () => ({ notesId: 'folder-2' })) as { user: { id: string; email: string } };
+    assert.equal(returning.user.id, account.userId);
+    assert.equal(returning.user.email, 'moved@example.com');
+    account = (await collections.googleAccounts(db).findOne({ googleAccountId: sub }))!;
+    assert.equal(account.driveRootFolderId, 'folder-2');
+    assert.equal(decryptToken(account.encryptedRefreshToken), 'refresh-1');
+    assert.equal(decryptToken(account.encryptedAccessToken), 'access-2');
+    assert.equal(await collections.users(db).countDocuments({ _id: account.userId }), 1);
+
+    assert.deepEqual(await login({ sub: randomUUID(), email: 'unverified@example.com', email_verified: false }), { error: 'invalid_id_token' });
+    const noRefresh = await login({ sub: randomUUID(), email: 'norefresh@example.com' }, { refresh_token: undefined });
+    assert.equal((noRefresh as { error: string }).error, 'refresh_token_required');
+    assert.equal(await collections.users(db).findOne({ email: 'norefresh@example.com' }), null);
+  });
+
+  await t.test('OAuth state is stored hashed, bound to a cookie, and rejected when the binding or lifetime is wrong', async () => {
+    const start = await app.request('/api/auth/google');
+    assert.equal(start.status, 302);
+    const cookie = start.headers.get('set-cookie')!;
+    assert.match(cookie, /atomic_oauth_state=/); assert.match(cookie, /HttpOnly/i); assert.match(cookie, /SameSite=Lax/i);
+    const binding = /atomic_oauth_state=([^;]+)/.exec(cookie)![1];
+    const state = new URL(start.headers.get('location')!).searchParams.get('state')!;
+    const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+    const states = db.collection<{ _id: string; binding: string; expiresAt: Date }>('oauth_states');
+    const stored = (await states.findOne({ _id: hash(state) }))!;
+    assert.equal(stored.binding, hash(binding));
+    assert.equal(await states.findOne({ _id: state }), null);
+
+    const callback = (query: string, cookieHeader?: string) => app.request(`/api/auth/callback?${query}`, { headers: cookieHeader ? { cookie: cookieHeader } : {} });
+    assert.equal((await callback(`code=x&state=${state}`)).status, 400);
+    assert.equal((await callback(`code=x&state=${state}`, 'atomic_oauth_state=wrong')).status, 400);
+    assert.equal((await callback('code=x&state=unknown', `atomic_oauth_state=${binding}`)).status, 400);
+    assert.ok(await states.findOne({ _id: hash(state) }), 'a rejected callback must not consume the state');
+    await states.updateOne({ _id: hash(state) }, { $set: { expiresAt: new Date(Date.now() - 1000) } });
+    assert.equal((await callback(`code=x&state=${state}`, `atomic_oauth_state=${binding}`)).status, 400);
   });
 });

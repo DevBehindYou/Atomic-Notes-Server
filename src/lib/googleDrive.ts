@@ -7,7 +7,7 @@ const APP_FOLDER_NAME = 'My-Atomic-Notes';
 function driveClient(accessToken: string, refreshToken: string): drive_v3.Drive {
   const auth = getOAuthClient();
   auth.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
-  return google.drive({ version: 'v3', auth });
+  return google.drive({ version: 'v3', auth, timeout: 20000 });
 }
 
 export async function findOrCreateFolder(
@@ -43,6 +43,27 @@ export async function ensureAppFolders(accessToken: string, refreshToken: string
   return { notesId };
 }
 
+const quoteQueryValue = (value: string) => value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+
+/**
+ * Drive and MongoDB cannot commit together, so a create can succeed and the
+ * metadata commit after it fail. Filenames are the note ID, so a retry looks
+ * for that file first and rewrites it instead of leaving a second copy.
+ */
+export async function createNoteFileWith(drive: drive_v3.Drive, parentId: string, filename: string, content: object) {
+  const media = () => ({ mimeType: 'application/json', body: Readable.from(JSON.stringify(content)) });
+  const fields = 'id, headRevisionId, modifiedTime';
+  const found = await drive.files.list({
+    q: `name = '${quoteQueryValue(filename)}' and '${quoteQueryValue(parentId)}' in parents and trashed = false`,
+    fields: 'files(id)', spaces: 'drive', pageSize: 1,
+  });
+  const existingId = found.data.files?.[0]?.id;
+  if (existingId) return (await drive.files.update({ fileId: existingId, media: media(), fields })).data;
+  return (await drive.files.create({
+    requestBody: { name: filename, parents: [parentId], mimeType: 'application/json' }, media: media(), fields,
+  })).data;
+}
+
 export async function createNoteFile(
   accessToken: string,
   refreshToken: string,
@@ -50,13 +71,7 @@ export async function createNoteFile(
   filename: string,
   content: object,
 ) {
-  const drive = driveClient(accessToken, refreshToken);
-  const res = await drive.files.create({
-    requestBody: { name: filename, parents: [parentId], mimeType: 'application/json' },
-    media: { mimeType: 'application/json', body: Readable.from(JSON.stringify(content)) },
-    fields: 'id, headRevisionId, modifiedTime',
-  });
-  return res.data;
+  return createNoteFileWith(driveClient(accessToken, refreshToken), parentId, filename, content);
 }
 
 export async function updateNoteFile(
@@ -68,6 +83,7 @@ export async function updateNoteFile(
   const drive = driveClient(accessToken, refreshToken);
   const res = await drive.files.update({
     fileId,
+    requestBody: { trashed: false },
     media: { mimeType: 'application/json', body: Readable.from(JSON.stringify(content)) },
     fields: 'id, headRevisionId, modifiedTime',
   });

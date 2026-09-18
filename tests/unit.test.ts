@@ -9,6 +9,8 @@ import { registerErrorHandler } from '../src/middleware/errorHandler';
 import { requireAdmin } from '../src/middleware/adminAuth';
 import { encryptToken, decryptToken } from '../src/lib/crypto';
 import { remoteNoteRowSchema } from '../src/types/noteWire';
+import { createNoteFileWith } from '../src/lib/googleDrive';
+import { assertProductionEnvironment, getEnvIssues } from '../src/lib/env';
 
 test('current Flutter push payload omits updated_at and cannot choose its owner', () => {
   const row = remoteNoteRowSchema.parse({
@@ -89,4 +91,51 @@ test('real Server entrypoint exposes health and rejects anonymous protected call
     ['/admin/notifications', 'GET'],
   ]) assert.equal((await app.request(`/api${path}`, { method })).status, 401, path);
   assert.equal((await app.request('/api/auth/google/mobile', { method: 'POST', body: '{}' })).status, 400);
+});
+
+test('Drive create reuses an existing file with the same name instead of leaving a second copy', async () => {
+  const calls: string[] = [];
+  const fakeDrive = (existingId: string | null) => ({ files: {
+    async list(args: { q: string }) { calls.push(`list:${args.q}`); return { data: { files: existingId ? [{ id: existingId }] : [] } }; },
+    async update(args: { fileId: string }) { calls.push(`update:${args.fileId}`); return { data: { id: args.fileId, headRevisionId: '2' } }; },
+    async create(args: { requestBody: { name: string; parents: string[] } }) { calls.push(`create:${args.requestBody.name}:${args.requestBody.parents[0]}`); return { data: { id: 'new-file', headRevisionId: '1' } }; },
+  } }) as unknown as Parameters<typeof createNoteFileWith>[0];
+
+  const reused = await createNoteFileWith(fakeDrive('file-9'), 'folder-1', 'note.atomic', { a: 1 });
+  assert.equal(reused.id, 'file-9');
+  assert.deepEqual(calls.map((call) => call.split(':')[0]), ['list', 'update']);
+  assert.match(calls[0], /name = 'note\.atomic' and 'folder-1' in parents and trashed = false/);
+
+  calls.length = 0;
+  const created = await createNoteFileWith(fakeDrive(null), "fold'er", 'note.atomic', { a: 1 });
+  assert.equal(created.id, 'new-file');
+  assert.deepEqual(calls.map((call) => call.split(':')[0]), ['list', 'create']);
+  assert.ok(calls[0].includes("'fold\\'er' in parents"));
+});
+
+test('encrypted and plaintext note content cannot be mixed', () => {
+  const base = { id: 'cfded5cb-1027-43a6-9f16-563a8132995e', kind: 'text', title: '', body: '', items: [], pinned: false,
+    deleted: false, created_at: '2026-09-14T18:00:00Z' };
+  assert.equal(remoteNoteRowSchema.safeParse({ ...base, enc_v: 1, payload: 'ciphertext' }).success, true);
+  assert.equal(remoteNoteRowSchema.safeParse({ ...base, enc_v: 1, payload: null }).success, false);
+  assert.equal(remoteNoteRowSchema.safeParse({ ...base, enc_v: 1, payload: 'ciphertext', body: 'leak' }).success, false);
+  assert.equal(remoteNoteRowSchema.safeParse({ ...base, enc_v: 0, payload: 'ciphertext' }).success, false);
+  assert.equal(remoteNoteRowSchema.safeParse({ ...base, enc_v: 0, payload: null, body: 'x'.repeat(131073) }).success, false);
+});
+
+test('configuration issues name variables without exposing values', () => {
+  const secret = 'super-secret-value-that-must-not-leak-into-output';
+  const good = {
+    MONGODB_URI: 'mongodb+srv://user:pass@cluster.example.net', TOKEN_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString('base64'),
+    GOOGLE_CLIENT_ID: 'id', GOOGLE_CLIENT_SECRET: 'secret', ADMIN_API_KEY: 'k'.repeat(32),
+    GOOGLE_REDIRECT_URI: 'https://atomic-notes-server-gde2e.vercel.app/api/auth/callback',
+  } as NodeJS.ProcessEnv;
+  assert.deepEqual(getEnvIssues(good), []);
+  const bad = { ...good, TOKEN_ENCRYPTION_KEY: secret, ADMIN_API_KEY: 'short', GOOGLE_CLIENT_ID: '', GOOGLE_REDIRECT_URI: 'http://localhost/cb' } as NodeJS.ProcessEnv;
+  const issues = getEnvIssues(bad);
+  assert.deepEqual(issues.map((issue) => issue.name).sort(), ['ADMIN_API_KEY', 'GOOGLE_CLIENT_ID', 'GOOGLE_REDIRECT_URI', 'TOKEN_ENCRYPTION_KEY']);
+  assert.equal(JSON.stringify(issues).includes(secret), false);
+  assert.doesNotThrow(() => assertProductionEnvironment({ ...bad, VERCEL_ENV: 'preview' } as NodeJS.ProcessEnv));
+  assert.throws(() => assertProductionEnvironment({ ...bad, VERCEL_ENV: 'production' } as NodeJS.ProcessEnv), /TOKEN_ENCRYPTION_KEY/);
+  assert.throws(() => assertProductionEnvironment({ ...bad, NODE_ENV: 'production' } as NodeJS.ProcessEnv), (error: Error) => !error.message.includes(secret));
 });

@@ -7,6 +7,7 @@ import { collections, type NotificationDoc } from '../db/collections';
 import { requireAdmin } from '../middleware/adminAuth';
 import { computeControllerStats } from '../lib/adminStats';
 import { logEvent } from '../lib/logs';
+import { getEnvIssues } from '../lib/env';
 
 const admin = new Hono();
 admin.use('*', requireAdmin);
@@ -15,12 +16,14 @@ admin.use('*', requireAdmin);
 // health
 // ---------------------------------------------------------------------------
 admin.get('/health', async (c) => {
+  // Variable names and problems only, never values.
+  const configuration = getEnvIssues();
   try {
     const db = await getDb();
     await collections.notifications(db).countDocuments({});
-    return c.json({ db: true, dbError: null, time: new Date().toISOString() });
+    return c.json({ db: true, dbError: null, configuration, time: new Date().toISOString() });
   } catch (e) {
-    return c.json({ db: false, dbError: e instanceof Error ? e.message : 'DB error', time: new Date().toISOString() });
+    return c.json({ db: false, dbError: e instanceof Error ? e.message : 'DB error', configuration, time: new Date().toISOString() });
   }
 });
 

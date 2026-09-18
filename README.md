@@ -99,17 +99,17 @@ MongoDB, using multi-document transactions (wallet update + ledger insert,
 atomically) in place of what a single Postgres function got for free. Exposed
 over HTTP at `/api/energy/*` (`src/routes/energy.ts`).
 
-**This is a primitives layer, not automatic gating.** In the live app, the
-*client* decides when to spend — `NotesRepository.syncNow()` calls
-`EnergyService.spendInstant()`/`spendStandard()` **before** pushing to
-Supabase, and refunds if the upload then fails. This backend's `/notes`
-endpoints deliberately don't charge energy internally, for the same reason:
-that decision belongs to whatever orchestrates sync (today, the Flutter
-client's `NotesRepository`), not to a single note's create/update/delete
-call. When the client side of this migration happens, point its sync
-orchestration at `POST /api/energy/spend-standard` (or `/spend` with
-`amount: 10, reason: "Instant sync"`) the same way it calls the Supabase RPC
-today, then call the `/notes` endpoints, then `/energy/refund` on failure.
+**Sync is charged by the Server, not the client.** `POST /api/notes/push`
+(`src/lib/syncOperation.ts`) charges the wallet when it accepts a request:
+instant costs 10, standard costs 5 and is free inside the hour after the last
+paid standard sync, an empty batch is free. The request is recorded in
+`sync_operations` under the client's `requestId`; if **no** note in the batch
+was delivered the Server refunds it, once, and restores the free window. A
+retry of a finished request returns the recorded outcome without charging or
+writing again. `POST /api/energy/refund` no longer exists (410): clients
+cannot ask for refunds. `/energy/spend` and `/energy/spend-standard` remain
+as primitives; `POST`/`PATCH` on `/api/notes` are only accepted inside a paid
+standard-sync window and require the `base_version` being edited.
 
 MongoDB transactions **require a replica set** — Atlas gives you one by
 default (including the free tier); a bare standalone `mongod` does not
@@ -131,24 +131,28 @@ this phrase" endpoint; that would defeat the design.
 
 ```bash
 npm install
-cp .env.example .env   # fill in MONGODB_URI, Google OAuth creds, TOKEN_ENCRYPTION_KEY
-npm run db:indexes     # creates indexes, including the sessions TTL index
+cp .env.example .env   # fill in every variable; see the comments in the file
+npm run db:indexes     # REQUIRED once per database: sessions/lock/OAuth-state TTL indexes and note indexes
 npm run dev             # local server on http://localhost:3000
 ```
 
+`db:indexes` changes the database named by `MONGODB_URI`/`MONGODB_DB_NAME`.
+The application never creates indexes itself; without the TTL indexes,
+expired locks, sessions and OAuth state are only ignored, not removed.
+
 Deploy: push to GitHub, import into Vercel, add the same env vars in the
 Vercel dashboard. `api/index.ts` + `vercel.json`'s rewrite route all `/api/*`
-requests to the one Hono app.
+requests to the one Hono app. On a production Vercel cold start
+(`VERCEL_ENV=production`), `src/lib/envGuard.ts` refuses to start if a required
+variable is missing or malformed and names the variable (never its value) in
+the function log; `GET /api/admin/health` reports the same list as
+`configuration`. The step-by-step first deployment is in
+`Project-Docs/10-deployment-guide.md` in the workspace.
 
-**Verification update (2026-09-14):** dependencies have been installed and
-`tsc --noEmit` passes locally after fixing Hono context declarations and the
-admin middleware's asynchronous return type. The dependency set is recorded
-in `package-lock.json`; use `npm ci` to reproduce it. This establishes a
-TypeScript compile pass, not runtime or deployment verification. MongoDB,
-Google OAuth/Drive, and cross-project integration tests remain pending the
-Flutter build gate. See `Project-Docs/07-test-verification-matrix.md` in the
-workspace for the recorded results and the root GitHub Actions workflow for
-hosted verification.
+**Verification status:** see [VERIFICATION.md](VERIFICATION.md) and
+`Project-Docs/09-agent-handoff.md`. Local typecheck, build, unit tests and
+audit pass on the working tree; the MongoDB integration suite runs only on
+GitHub Actions; nothing has run against real Google or a deployed Server.
 
 ## What's real vs. stubbed
 
@@ -164,34 +168,47 @@ Controller panel.
 
 **Deliberately stubbed, not silently faked:**
 - `POST /api/folders` — same 501-with-a-pointer as the first pass.
-- **Conflict detection on note edits** — still last-write-wins; the fields
-  needed for a real check (`driveRevisionId`, `localVersion`) are there, the
-  check itself isn't wired in yet.
-- **CSRF state on the OAuth flow** — noted inline in `routes/auth.ts`.
 - **Rate limiting** — needs a durable store (Upstash/Vercel KV), not a fake
   in-memory limiter that no-ops on serverless.
 - **Realtime/push sync** — Supabase Realtime (websocket, row-level push) has
   no Drive equivalent; `changes.watch` webhooks are coarser. Still an open
-  infra decision, not built.
+  infra decision, not built. Other devices see changes on their next sync.
+- **Drive files changed outside the app** — a note whose Drive file was
+  permanently deleted or replaced by the user makes that note fail with
+  `note_write_failed` on every push; there is no repair path yet.
+- **Delivered-but-unacknowledged pushes after the App loses its saved
+  request** — the Server then sees the retry as a version conflict and the App
+  keeps the edit as a "(conflict copy)" note. Nothing is lost, but a duplicate
+  can appear.
 - The `notifications_feed`/`notification_mark_read`/etc. RPCs exist in the
-  live app too (same shape as Energy) but aren't touched here — flagging so
-  it isn't a surprise later, not because it's hard. (Second-pass addition:
-  it's actually two tables — a global `notifications` table, admin/service-
-  role write only, plus a per-user `user_notifications` read-state table —
-  per TESTING.md's RLS review.)
+  live app too but aren't touched here (per-user read/dismiss state).
 
-**One architecture-level mismatch worth knowing about, not just a missing
-endpoint:** the live app's actual sync isn't per-note REST calls — `_push`/
-`_pull` in `notes_repository.dart` batch-upsert all locally-dirty notes in
-one call and pull everything changed since a cursor, backstopped by a
-Realtime subscription for anything the cursor's client-clock skew might
-miss (a known, documented low-risk issue in TESTING.md, L-1). This backend's
-`/notes` endpoints are per-note CRUD instead — simpler REST, but a real
-design choice, not an oversight. If the Flutter client is ever pointed at
-this API instead of Supabase, its sync engine talking to per-note endpoints
-one at a time (instead of one batched push/pull) is a bigger behavioral
-change than swapping which backend it calls, and worth deciding on
-deliberately rather than discovering during that integration.
+## Sync protocol (App <-> Server)
+
+Both sides must ship together.
+
+- **Push:** `POST /api/notes/push` with `{ requestId (UUID), mode: "standard" | "instant", rows: [...] }`,
+  at most 20 rows. Each row carries `base_version` (the version the App last
+  saw, 0 for a new note). A row whose `base_version` is not the stored version
+  fails with `note_conflict` (and the current `version`); nothing is
+  overwritten. Any failed row makes the response HTTP 502 with per-row
+  `results`; a batch where every row failed is refunded. Success rows carry the
+  new `version` and `updated_at`.
+- **Idempotency:** the same `requestId` with the same rows returns the recorded
+  result; with different rows it is 409 `sync_request_mismatch`. A request
+  that died midway is settled by the user's next write from stored results:
+  a row counts as delivered only if its success was committed together with
+  its note metadata.
+- **Pull:** `GET /api/notes/pull?after=<cursor>` returns ten rows ordered by a
+  per-user monotonic `syncSequence`, plus `nextCursor` and `hasMore`. Deleted
+  notes stay as tombstones so other devices learn about them.
+- **Per-user lock:** every `/api/notes` request holds a Mongo lock for that
+  user (lease 600 s, longer than the 300 s function limit). Requests wait up
+  to 15 s for it, then fail with 409 `operation_in_progress`.
+- **Drive vs MongoDB:** they cannot commit together. New Drive files are named
+  `<noteId>.atomic` and a retry reuses an existing file of that name instead of
+  creating a second one. A success is never reported before its metadata is
+  committed.
 
 ## Admin API (`/api/admin/*`) — for Atomic Community's Controller panel
 

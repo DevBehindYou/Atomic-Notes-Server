@@ -1,5 +1,23 @@
 # Server readiness review — September 14, 2026
 
+> **Current checkpoint, September 15:** the sections below describe the
+> previously verified commit `726539d1f94cc3c4e20c36e11635c090f20891e5`.
+> A new, uncommitted readiness pass changes OAuth, note versions/cursors,
+> idempotent sync charging, the Google SDK and the Vercel entrypoint. Several
+> historical blockers below have candidate fixes, but updated integration
+> tests and live Google/deployment checks have not passed yet. The new SDK
+> install reported zero vulnerabilities and the latest local typecheck passed.
+> See [the workspace handoff](../Project-Docs/09-agent-handoff.md) when using
+> the full workspace; `SESSION-HANDOFF.md` provides a repository-local summary.
+
+> **Status of the blockers listed below, September 19:** code changes exist for
+> all of them except rate limiting, broad pagination, Drive-file repair and
+> `sync_operations` expiry. Locally verified: typecheck, build, 11 unit tests,
+> zero audit vulnerabilities. The matching integration scenarios are written but
+> have not run (they need a MongoDB replica set: GitHub Actions only). Nothing
+> has run against real Google or a deployed function. See
+> [the workspace handoff](../Project-Docs/09-agent-handoff.md), item table.
+
 ## Verdict
 
 The App and Community are wired to Server routes, but full integration and
@@ -55,11 +73,23 @@ the App cursor/concurrency issues below.
   or a running Community browser UI. The standalone Server workflow cannot
   independently prove execution of the other two repositories.
 
-The hosted database suite is **pending push/run**, not claimed as passed.
+The hosted database suite **passed** in `logs_94679360100.zip` on September
+15, 2026, at commit `726539d1f94cc3c4e20c36e11635c090f20891e5` (matching local
+HEAD). Install, typecheck and build passed; all eight unit tests and six
+MongoDB/API scenarios passed (seven TAP tests including the integration
+parent). No tests failed or were skipped. Replica-set setup and cleanup passed.
+
+The `simulated_delete_failure` stack trace is intentional fault injection:
+the following passing test confirms a failed wipe preserves Mongo metadata.
+The audit gate passed at `--audit-level=high`; the four moderate dependency
+entries above remain unresolved. Action-internal `punycode` and `url.parse`
+deprecations did not fail the run. No functional code change was needed for
+this log; real Google and deployed cross-project integration remain unverified.
+
 Apply `npm run db:indexes` to the intended deployment database during setup;
 the application does not automatically create indexes.
 
-## Remaining release blockers and limits
+## Remaining release blockers and limits (as of September 14; see the status note at the top)
 
 1. **OAuth:** browser state is generated but neither persisted nor verified
    at callback. Returning login requires a fresh refresh token even if a
@@ -95,9 +125,7 @@ operations, not wallet transaction statements.
 
 ## Next verification step
 
-Commit all Server changes, including the previously untracked `.github/`
-directory, `tests/`, `src/lib/concurrency.ts`, `src/lib/validation.ts`, `src/types/noteWire.ts`, and
-`tsconfig.test.json`. Push to main and run **Server verification**.
-Review that log before claiming MongoDB/API integration passes. Real Google
-onboarding, a deployed Server, Community UI actions and multi-device App
-sync remain subsequent end-to-end checks.
+The build and focused MongoDB/API verification gate is satisfied for the
+recorded commit. Address the release blockers above before production
+deployment. Real Google onboarding, a deployed test Server, Community UI
+actions and multi-device App sync remain subsequent end-to-end checks.

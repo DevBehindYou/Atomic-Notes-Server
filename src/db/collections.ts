@@ -178,10 +178,11 @@ export const noteSchema = z.object({
   kind: z.enum(['text', 'todo']),
   pinned: z.boolean().default(false),
   deleted: z.boolean().default(false),
-  encV: z.number().int().default(0),
+  encV: z.union([z.literal(0), z.literal(1)]).default(0),
   driveFileId: z.string(),
   driveRevisionId: z.string().nullable(),
   localVersion: z.number().int().default(1),
+  syncSequence: z.number().int().optional(),
   syncStatus: z.enum(['synced', 'pending', 'conflict', 'error']).default('synced'),
   createdAt: z.date(),
   updatedAt: z.date(),
@@ -265,6 +266,9 @@ export const collections = {
 
 /** Call once at startup (or via a one-off script) — indexes are not auto-created. */
 export async function ensureIndexes(db: Db) {
+  await db.collection("sync_operations").createIndex({ userId: 1, status: 1 });
+  await db.collection("oauth_states").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+  await db.collection("operation_locks").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
   await collections.users(db).createIndex({ email: 1 }, { unique: true });
   await collections.googleAccounts(db).createIndex({ googleAccountId: 1 }, { unique: true });
   await collections.googleAccounts(db).createIndex({ userId: 1 });
@@ -273,6 +277,7 @@ export async function ensureIndexes(db: Db) {
   await collections.energyLedger(db).createIndex({ userId: 1, createdAt: -1 });
   await collections.notes(db).createIndex({ userId: 1, deleted: 1 });
   await collections.notes(db).createIndex({ userId: 1, updatedAt: 1 });
+  await collections.notes(db).createIndex({ userId: 1, syncSequence: 1 });
   await collections.sessions(db).createIndex({ userId: 1, createdAt: -1 });
   await collections.folders(db).createIndex({ userId: 1 });
   await collections.logs(db).createIndex({ userId: 1, createdAt: -1 });

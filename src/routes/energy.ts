@@ -11,7 +11,6 @@ import {
   energyConvert,
   energySpend,
   energySpendStandard,
-  energyRefund,
   energyHistory,
 } from '../lib/energy';
 
@@ -111,14 +110,7 @@ energy.post('/spend-standard', async (c) => {
   }
 });
 
-const refundSchema = z.object({ amount: z.number().int().positive(), reason: z.string().min(1).max(200) });
-energy.post('/refund', async (c) => {
-  const userId = c.get('userId') as string;
-  const db = await getDb();
-  const { amount, reason } = refundSchema.parse(await c.req.json());
-  await energyRefund(db, userId, amount, reason);
-  const wallet = await collections.atomicUsers(db).findOne({ _id: userId });
-  return c.json({ wallet: walletToWire(wallet) });
-});
+// Refunds are performed only by the Server when a recorded sync fails.
+energy.post('/refund', (c) => c.json({ error: 'client_refunds_disabled' }, 410));
 
 export default energy;

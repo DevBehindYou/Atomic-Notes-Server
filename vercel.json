@@ -3,6 +3,7 @@
   "framework": null,
   "installCommand": "npm ci",
   "buildCommand": "npm run build",
+  "outputDirectory": "public",
   "functions": { "api/index.ts": { "maxDuration": 300 } },
   "rewrites": [{ "source": "/api/(.*)", "destination": "/api" }]
 }

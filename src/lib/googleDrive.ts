@@ -114,3 +114,9 @@ export async function getNoteFileContent(accessToken: string, refreshToken: stri
   const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'json' });
   return res.data as Record<string, unknown>;
 }
+
+/** True when Google answered "not found": the file or its folder was deleted outside the app. */
+export function isDriveNotFound(error: unknown): boolean {
+  const e = error as { code?: number | string; status?: number | string; response?: { status?: number | string } } | null;
+  return [e?.code, e?.status, e?.response?.status].some((value) => value === 404 || value === '404');
+}

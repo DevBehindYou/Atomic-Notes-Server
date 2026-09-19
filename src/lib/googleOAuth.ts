@@ -54,3 +54,19 @@ export async function refreshAccessToken(refreshToken: string) {
   const { credentials } = await client.refreshAccessToken();
   return credentials;
 }
+
+/** True when Google says the stored refresh token no longer works (revoked, or expired after 7 days in Testing). */
+export function isInvalidGrant(error: unknown): boolean {
+  const e = error as { message?: string; response?: { data?: { error?: string } } } | null;
+  return e?.response?.data?.error === 'invalid_grant' || /invalid_grant/.test(e?.message ?? '');
+}
+
+export type GoogleProfile = { sub?: string; email?: string; email_verified?: boolean; name?: string };
+
+/** OpenID Connect userinfo for an access token this Server obtained itself. Null if Google refuses. */
+export async function fetchGoogleProfile(accessToken: string): Promise<GoogleProfile | null> {
+  const response = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+    headers: { authorization: `Bearer ${accessToken}` }, signal: AbortSignal.timeout(10000),
+  });
+  return response.ok ? await response.json() as GoogleProfile : null;
+}

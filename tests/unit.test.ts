@@ -13,6 +13,9 @@ import { encryptToken, decryptToken } from '../src/lib/crypto';
 import { remoteNoteRowSchema } from '../src/types/noteWire';
 import { createNoteFileWith } from '../src/lib/googleDrive';
 import { assertProductionEnvironment, getEnvIssues } from '../src/lib/env';
+import { isDriveNotFound } from '../src/lib/googleDrive';
+import { isInvalidGrant } from '../src/lib/googleOAuth';
+import { httpError } from '../src/lib/httpError';
 
 test('current Flutter push payload omits updated_at and cannot choose its owner', () => {
   const row = remoteNoteRowSchema.parse({
@@ -140,6 +143,59 @@ test('configuration issues name variables without exposing values', () => {
   assert.doesNotThrow(() => assertProductionEnvironment({ ...bad, VERCEL_ENV: 'preview' } as NodeJS.ProcessEnv));
   assert.throws(() => assertProductionEnvironment({ ...bad, VERCEL_ENV: 'production' } as NodeJS.ProcessEnv), /TOKEN_ENCRYPTION_KEY/);
   assert.throws(() => assertProductionEnvironment({ ...bad, NODE_ENV: 'production' } as NodeJS.ProcessEnv), (error: Error) => !error.message.includes(secret));
+});
+
+test('Google error shapes are recognised: missing Drive file and revoked or expired grant', () => {
+  for (const missing of [{ code: 404 }, { code: '404' }, { status: 404 }, { response: { status: 404 } }]) {
+    assert.equal(isDriveNotFound(missing), true, JSON.stringify(missing));
+  }
+  for (const other of [{ code: 500 }, { status: 403 }, new Error('boom'), null, undefined, 'text']) {
+    assert.equal(isDriveNotFound(other), false);
+  }
+  assert.equal(isInvalidGrant({ response: { data: { error: 'invalid_grant' } } }), true);
+  assert.equal(isInvalidGrant(new Error('invalid_grant: Token has been expired or revoked.')), true);
+  assert.equal(isInvalidGrant(new Error('socket hang up')), false);
+  assert.equal(isInvalidGrant(null), false);
+});
+
+test('only our own errors show their code; Google errors with a status never leak', async () => {
+  const app = new Hono();
+  registerErrorHandler(app);
+  app.get('/reauth', () => { throw httpError('google_reauth_required', 401); });
+  app.get('/busy', () => { throw httpError('operation_in_progress', 409); });
+  // A Google client error also has a numeric status and a message that may contain request details.
+  app.get('/google', () => { throw Object.assign(new Error('Bearer ya29.secret-token in request'), { status: 401 }); });
+  const reauth = await app.request('/reauth');
+  assert.deepEqual([reauth.status, await reauth.json()], [401, { error: 'google_reauth_required' }]);
+  const busy = await app.request('/busy');
+  assert.deepEqual([busy.status, await busy.json()], [409, { error: 'operation_in_progress' }]);
+  const google = await app.request('/google');
+  assert.equal(google.status, 500);
+  assert.deepEqual(await google.json(), { error: 'internal_error' });
+});
+
+test('a revoked Google grant answers 401 google_reauth_required and logs no request headers', async () => {
+  const app = new Hono();
+  registerErrorHandler(app);
+  app.get('/revoked', () => {
+    throw Object.assign(new Error('invalid_grant'), {
+      response: { data: { error: 'invalid_grant' } },
+      config: { headers: { Authorization: 'Bearer ya29.super-secret-token' } },
+    });
+  });
+  app.get('/boom', () => {
+    throw Object.assign(new Error('Request failed with status code 500'), { config: { headers: { Authorization: 'Bearer ya29.super-secret-token' } } });
+  });
+  const logged: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  try {
+    const revoked = await app.request('/revoked');
+    assert.deepEqual([revoked.status, await revoked.json()], [401, { error: 'google_reauth_required' }]);
+    assert.equal((await app.request('/boom')).status, 500);
+  } finally { console.error = original; }
+  assert.ok(logged.length >= 1);
+  assert.equal(logged.join('\n').includes('ya29.super-secret-token'), false);
 });
 
 test('relative imports name .js files so the compiled output runs under plain Node ESM', () => {

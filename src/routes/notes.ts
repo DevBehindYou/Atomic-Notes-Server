@@ -11,13 +11,23 @@ import { getDb } from '../db/mongo.js';
 import { collections, type NoteDoc } from '../db/collections.js';
 import { requireAuth } from '../middleware/auth.js';
 import { decryptToken, encryptToken } from '../lib/crypto.js';
-import { createNoteFile, updateNoteFile, deleteNoteFile, getNoteFileContent } from '../lib/googleDrive.js';
-import { refreshAccessToken } from '../lib/googleOAuth.js';
-import { todoItemSchema, migrateAtomicFile } from '../types/atomicFile.js';
+import { createNoteFile, updateNoteFile, deleteNoteFile, getNoteFileContent, ensureAppFolders, isDriveNotFound } from '../lib/googleDrive.js';
+import { isInvalidGrant, refreshAccessToken } from '../lib/googleOAuth.js';
+import { todoItemSchema, migrateAtomicFile, CorruptAtomicFileError } from '../types/atomicFile.js';
+import { httpError } from '../lib/httpError.js';
 import { logEvent } from '../lib/logs.js';
 
-export function createNotesRoute(drive = { createNoteFile, updateNoteFile, deleteNoteFile, getNoteFileContent }) {
+export type DriveAdapter = {
+  createNoteFile: typeof createNoteFile;
+  updateNoteFile: typeof updateNoteFile;
+  deleteNoteFile: typeof deleteNoteFile;
+  getNoteFileContent: typeof getNoteFileContent;
+  ensureAppFolders?: typeof ensureAppFolders;
+};
+
+export function createNotesRoute(drive: DriveAdapter = { createNoteFile, updateNoteFile, deleteNoteFile, getNoteFileContent }) {
   const { createNoteFile, updateNoteFile, deleteNoteFile, getNoteFileContent } = drive;
+  const ensureFolders = drive.ensureAppFolders ?? ensureAppFolders;
   const notesRoute = new Hono();
   notesRoute.use('*', requireAuth);
   notesRoute.use('*', async (c, next) => {
@@ -68,7 +78,14 @@ export function createNotesRoute(drive = { createNoteFile, updateNoteFile, delet
     const refreshToken = decryptToken(account.encryptedRefreshToken);
 
     if (account.tokenExpiry.getTime() < Date.now() + 60_000) {
-      const refreshed = await refreshAccessToken(refreshToken);
+      let refreshed;
+      try {
+        refreshed = await refreshAccessToken(refreshToken);
+      } catch (error) {
+        // Revoked, or expired after seven days while the OAuth app is in Testing: the App signs in again.
+        if (isInvalidGrant(error)) throw httpError('google_reauth_required', 401);
+        throw error;
+      }
       accessToken = refreshed.access_token!;
       await collections.googleAccounts(db).updateOne(
         { userId },
@@ -279,6 +296,20 @@ export function createNotesRoute(drive = { createNoteFile, updateNoteFile, delet
     const operation = recorded ?? await beginSync(db, userId, requestId, rows, mode);
     const decided = new Set(operation.results.map((result) => result.id));
 
+    // Files and folders the user deleted in Drive are recreated instead of failing every later push.
+    let folderId = driveFolderId;
+    const createInFolder = async (name: string, content: object) => {
+      try {
+        return await createNoteFile(accessToken, refreshToken, folderId, name, content);
+      } catch (error) {
+        if (!isDriveNotFound(error)) throw error;
+        folderId = (await ensureFolders(accessToken, refreshToken)).notesId;
+        await collections.googleAccounts(db).updateOne({ userId }, { $set: { driveRootFolderId: folderId } });
+        await logEvent(db, 'drive_folder_recreated', { userId, level: 'warn' });
+        return createNoteFile(accessToken, refreshToken, folderId, name, content);
+      }
+    };
+
     for (const row of rows) {
       if (decided.has(row.id)) continue;
       try {
@@ -305,15 +336,34 @@ export function createNotesRoute(drive = { createNoteFile, updateNoteFile, delet
         let driveFileId: string;
         let driveRevisionId: string | null;
         if (existing) {
-          const f = await updateNoteFile(accessToken, refreshToken, existing.driveFileId, driveContent);
-          driveFileId = existing.driveFileId;
-          driveRevisionId = f.headRevisionId ?? existing.driveRevisionId;
+          try {
+            const f = await updateNoteFile(accessToken, refreshToken, existing.driveFileId, driveContent);
+            driveFileId = existing.driveFileId;
+            driveRevisionId = f.headRevisionId ?? existing.driveRevisionId;
+          } catch (error) {
+            if (!isDriveNotFound(error)) throw error;
+            driveFileId = existing.driveFileId;
+            driveRevisionId = existing.driveRevisionId;
+            // Deleted outside the app. A deleted note needs no file; a live one is written again.
+            if (!row.deleted) {
+              const f = await createInFolder(`${row.id}.atomic`, driveContent);
+              driveFileId = f.id!;
+              driveRevisionId = f.headRevisionId ?? null;
+              await logEvent(db, 'drive_file_recreated', { userId, level: 'warn', meta: { noteId: row.id } });
+            }
+          }
         } else {
-          const f = await createNoteFile(accessToken, refreshToken, driveFolderId, `${row.id}.atomic`, driveContent);
+          const f = await createInFolder(`${row.id}.atomic`, driveContent);
           driveFileId = f.id!;
           driveRevisionId = f.headRevisionId ?? null;
         }
-        if (row.deleted) await deleteNoteFile(accessToken, refreshToken, driveFileId);
+        if (row.deleted) {
+          try {
+            await deleteNoteFile(accessToken, refreshToken, driveFileId);
+          } catch (error) {
+            if (!isDriveNotFound(error)) throw error; // already gone
+          }
+        }
 
         const setFields = {
           userId,
@@ -332,6 +382,9 @@ export function createNotesRoute(drive = { createNoteFile, updateNoteFile, delet
           _id: row.id, ...setFields, folderId: null, createdAt: new Date(row.created_at), localVersion: 1,
         }, operation._id);
       } catch (e) {
+        // A revoked grant fails every row alike. Stop here without recording failures: the operation
+        // stays open, the App signs in again and retries the same request, which resumes it.
+        if (isInvalidGrant(e)) throw httpError('google_reauth_required', 401);
         // Message only: Google client errors can carry request headers with bearer tokens.
         console.error('note_write_failed', row.id, e instanceof Error ? e.message : 'unknown');
         // A no-op when the commit did succeed but its response was lost: stored success wins.
@@ -381,14 +434,25 @@ export function createNotesRoute(drive = { createNoteFile, updateNoteFile, delet
 
     // Bound Drive requests while retaining row order. This does not replace
     // pagination or a durable sync cursor for large accounts.
-    const rows = await mapConcurrent(metaRows, 4, async (m) => {
+    const unreadable: string[] = [];
+    const rows = (await mapConcurrent(metaRows, 4, async (m) => {
         if (m.deleted) return toWireRow(m, { title: '', body: '', items: [], payload: null });
-        const raw = await getNoteFileContent(accessToken, refreshToken, m.driveFileId);
-        const content = migrateAtomicFile(raw);
-        return toWireRow(m, { title: content.title, body: content.body, items: content.items, payload: content.payload });
-      });
+        try {
+          const raw = await getNoteFileContent(accessToken, refreshToken, m.driveFileId);
+          const content = migrateAtomicFile(raw);
+          return toWireRow(m, { title: content.title, body: content.body, items: content.items, payload: content.payload });
+        } catch (error) {
+          // A file deleted or corrupted in Drive must not block every other note. Skip it (devices
+          // that still hold the note keep it; their next edit writes the file again). Transient
+          // Google or network errors still fail the request so the App retries.
+          if (!isDriveNotFound(error) && !(error instanceof CorruptAtomicFileError)) throw error;
+          unreadable.push(m._id);
+          return null;
+        }
+      })).filter((row): row is RemoteNoteRow => row !== null);
+    if (unreadable.length) await logEvent(db, 'notes_unreadable', { userId, level: 'warn', meta: { noteIds: unreadable } });
 
-    return c.json({ rows, cursor, nextCursor, hasMore });
+    return c.json({ rows, cursor, nextCursor, hasMore, skipped: unreadable.length });
   });
 
   /** Hard-deletes everything (not just tombstones) — mirrors the live app's wipeRemote(), used on account/vault reset. */
@@ -399,7 +463,13 @@ export function createNotesRoute(drive = { createNoteFile, updateNoteFile, delet
 
     if (all.length > 0) {
       const { accessToken, refreshToken } = await getLiveGoogleTokens(db, userId);
-      await mapConcurrent(all, 4, (n) => deleteNoteFile(accessToken, refreshToken, n.driveFileId));
+      await mapConcurrent(all, 4, async (n) => {
+        try {
+          await deleteNoteFile(accessToken, refreshToken, n.driveFileId);
+        } catch (error) {
+          if (!isDriveNotFound(error)) throw error; // already deleted in Drive
+        }
+      });
     }
     for (const note of all) {
       await saveNoteMetadata(db, userId, note._id, { deleted: true, updatedAt: new Date() });

@@ -173,9 +173,12 @@ Controller panel.
 - **Realtime/push sync** — Supabase Realtime (websocket, row-level push) has
   no Drive equivalent; `changes.watch` webhooks are coarser. Still an open
   infra decision, not built. Other devices see changes on their next sync.
-- **Drive files changed outside the app** — a note whose Drive file was
-  permanently deleted or replaced by the user makes that note fail with
-  `note_write_failed` on every push; there is no repair path yet.
+- **Drive files changed outside the app** are handled but not undone: a
+  permanently deleted note file is skipped by pull (reported as `skipped`, with a
+  `notes_unreadable` log event) and written again by the next push of that note
+  (`drive_file_recreated`); a deleted app folder is recreated once
+  (`drive_folder_recreated`); wiping tolerates files that are already gone.
+  Devices that never held the note cannot recover its content.
 - **Delivered-but-unacknowledged pushes after the App loses its saved
   request** — the Server then sees the retry as a version conflict and the App
   keeps the edit as a "(conflict copy)" note. Nothing is lost, but a duplicate
@@ -202,6 +205,12 @@ Both sides must ship together.
 - **Pull:** `GET /api/notes/pull?after=<cursor>` returns ten rows ordered by a
   per-user monotonic `syncSequence`, plus `nextCursor` and `hasMore`. Deleted
   notes stay as tombstones so other devices learn about them.
+- **Revoked or expired Google grant:** when Google refuses the stored refresh
+  token (the user revoked the app, or seven days passed in *Testing*), the
+  request answers 401 `google_reauth_required`. The App treats a 401 as an ended
+  session and shows the sign-in screen. A push that was already accepted stays
+  open; after signing in, retrying the same `requestId` resumes it without a
+  second charge.
 - **Per-user lock:** every `/api/notes` request holds a Mongo lock for that
   user (lease 600 s, longer than the 300 s function limit). Requests wait up
   to 15 s for it, then fail with 409 `operation_in_progress`.

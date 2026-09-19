@@ -29,10 +29,13 @@ export const atomicFileV1Schema = z.object({
 
 export type AtomicFileV1 = z.infer<typeof atomicFileV1Schema>;
 
+/** A Drive file that exists but is not a readable note (edited or replaced outside the app). */
+export class CorruptAtomicFileError extends Error {}
+
 export function migrateAtomicFile(raw: unknown): AtomicFileV1 {
   const parsed = atomicFileV1Schema.safeParse(raw);
   if (parsed.success) return parsed.data;
   // Add `if (raw.version === <older>) return upgrade(raw)` branches here as the
   // format evolves, instead of failing every file written before a schema change.
-  throw new Error('Unrecognized or corrupt .atomic file — no migration path defined for this shape yet.');
+  throw new CorruptAtomicFileError('Unrecognized or corrupt .atomic file — no migration path defined for this shape yet.');
 }

@@ -8,7 +8,7 @@ import { getDb, withTransaction } from '../db/mongo.js';
 import { acquireOperationLock } from '../lib/operationLock.js';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import { collections } from '../db/collections.js';
-import { getAuthUrl, getOAuthClient, getOAuthClientForServerAuthCode } from '../lib/googleOAuth.js';
+import { fetchGoogleProfile, getAuthUrl, getOAuthClient, getOAuthClientForServerAuthCode } from '../lib/googleOAuth.js';
 import { ensureAppFolders } from '../lib/googleDrive.js';
 import { encryptToken, decryptToken } from '../lib/crypto.js';
 import { createSession, revokeSession } from '../lib/session.js';
@@ -26,11 +26,15 @@ const auth = new Hono();
  */
 export async function completeGoogleLogin(
   db: Db, client: Pick<ReturnType<typeof getOAuthClient>, 'verifyIdToken'>, tokens: Credentials,
-  userAgent: string | null | undefined, setupFolders = ensureAppFolders,
+  userAgent: string | null | undefined, setupFolders = ensureAppFolders, profileOf = fetchGoogleProfile,
 ) {
-  if (!tokens.access_token || !tokens.id_token) return { error: 'incomplete_token_response' as const };
-  const ticket = await client.verifyIdToken({ idToken: tokens.id_token, audience: process.env.GOOGLE_CLIENT_ID! });
-  const payload = ticket.getPayload();
+  if (!tokens.access_token) return { error: 'incomplete_token_response' as const };
+  // The ID token is the normal source of identity. If Google left it out of the exchange, the
+  // userinfo endpoint answers for the access token this Server itself just obtained with its secret.
+  const payload = tokens.id_token
+    ? (await client.verifyIdToken({ idToken: tokens.id_token, audience: process.env.GOOGLE_CLIENT_ID! })).getPayload()
+    : await profileOf(tokens.access_token);
+  if (!payload && !tokens.id_token) return { error: 'incomplete_token_response' as const };
   if (!payload?.email || !payload.sub || payload.email_verified !== true) return { error: 'invalid_id_token' as const };
   const googleAccountId = payload.sub;
   const release = await acquireOperationLock(db, `google:${googleAccountId}`);

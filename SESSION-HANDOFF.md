@@ -33,13 +33,26 @@ Resume only on a new user request.
   and shares content bounds with push. Production env validation and the
   `configuration` field on `/api/admin/health`. README corrected.
 
+## Added after the first deployment (September 19, uncommitted)
+
+- Pull skips notes whose Drive file is missing or corrupt (`skipped` count, log event) instead of failing
+  the whole pull; push recreates a missing file or app folder; wipe tolerates missing files.
+- A revoked or expired Google grant answers 401 `google_reauth_required` (push, pull, wipe); an accepted
+  push stays open and resumes on retry. The error handler no longer logs whole error objects (they can
+  carry bearer tokens).
+- Sign-in falls back to the Google profile endpoint if the token response has no ID token.
+- `sync_operations` expire after 30 days (**run `npm run db:indexes` again**).
+- `npm run db:inspect -- <email>`: read-only account state for device tests.
+- Local: typecheck, build, compiled-entrypoint load, 15 unit tests, audit 0. The new integration
+  scenarios (Drive deletions, revoked grant, profile fallback, TTL index) have not run on GitHub yet.
+
 ## Still open
 
-Rate limiting; unpaginated `GET /notes` and admin lists; repair of notes whose
-Drive file was deleted outside the app; expiry of `sync_operations`; real Google
-and Vercel verification (including that the `vercel.json` rewrite passes the
-original `/api/...` path); load testing. A delivered push whose App-side request
-record was lost surfaces as a "(conflict copy)" in the App.
+Rate limiting; unpaginated `GET /notes` and admin lists; real Google verification
+(sign-in, Drive writes) and multi-device checks on a phone; load testing. A
+delivered push whose App-side request record was lost surfaces as a
+"(conflict copy)" in the App. A note whose Drive file was deleted cannot be
+recovered by a device that never held it.
 
 App and Server must ship the new push/pull protocol together. Run
 `npm run db:indexes` against the intended Atlas database during setup only, and

@@ -43,23 +43,37 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
 
   const files = new Map<string, any>();
   let writes = 0, failDelete = false, failTitle = '', activeReads = 0, peakReads = 0;
+  // Simulates what a user can do in Drive outside the app.
+  const missingFiles = new Set<string>(); let missingFolder = '', foldersEnsured = 0;
+  const notFound = () => Object.assign(new Error('File not found'), { code: 404 });
+  // The user revoked the app in their Google account: every Drive call fails as Google reports it.
+  let revoked = false;
+  const revokedError = () => Object.assign(new Error('invalid_grant'), { response: { data: { error: 'invalid_grant' } } });
   const drive = {
-    async createNoteFile(_a: string, _r: string, _p: string, _n: string, content: object) {
+    async createNoteFile(_a: string, _r: string, parent: string, _n: string, content: object) {
+      if (revoked) throw revokedError();
+      if (missingFolder && parent === missingFolder) throw notFound();
       if ((content as any).title === failTitle && failTitle) throw new Error('simulated_drive_failure');
       writes++; const id = randomUUID(); files.set(id, structuredClone(content)); return { id, headRevisionId: '1' };
     },
     async updateNoteFile(_a: string, _r: string, id: string, content: object) {
+      if (revoked) throw revokedError();
+      if (missingFiles.has(id)) throw notFound();
       if ((content as any).title === failTitle && failTitle) throw new Error('simulated_drive_failure');
       writes++; files.set(id, structuredClone(content)); return { id, headRevisionId: '2' };
     },
-    async deleteNoteFile(_a: string, _r: string, _id: string) {
+    async deleteNoteFile(_a: string, _r: string, id: string) {
+      if (missingFiles.has(id)) throw notFound();
       if (failDelete) throw new Error('simulated_delete_failure');
       writes++;
     },
     async getNoteFileContent(_a: string, _r: string, id: string) {
+      if (revoked) throw revokedError();
+      if (missingFiles.has(id)) throw notFound();
       peakReads = Math.max(peakReads, ++activeReads); await delay(5); activeReads--;
       return structuredClone(files.get(id));
     },
+    async ensureAppFolders() { foldersEnsured++; missingFolder = ''; return { notesId: 'recreated-folder' }; },
   };
   const app = new Hono(); registerErrorHandler(app);
   app.route('/api/notes', createNotesRoute(drive));
@@ -349,6 +363,101 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
     const late = row();
     await assert.rejects(saveNoteMetadata(db, account.id, late.id, fields, { _id: late.id, ...fields, folderId: null, createdAt: new Date(), localVersion: 1 }, partial._id), /sync_operation_closed/);
     assert.equal(await collections.notes(db).findOne({ _id: late.id }), null);
+  });
+
+  await t.test('files and folders deleted in Drive: pull skips them, push recreates them, wipe tolerates them', async () => {
+    const account = await user(), a = row({ title: 'A' }), b = row({ title: 'B' });
+    assert.equal((await push([a, b], account.token)).status, 200);
+    const meta = async (id: string) => (await collections.notes(db).findOne({ _id: id }))!;
+    const oldFileOfA = (await meta(a.id)).driveFileId;
+    missingFiles.add(oldFileOfA);
+
+    // One permanently deleted file must not stop the account from syncing.
+    const pulled = await json(await request('/notes/pull', 'GET', undefined, account.token));
+    assert.deepEqual(pulled.rows.map((r: any) => r.id), [b.id]);
+    assert.equal(pulled.skipped, 1);
+    assert.equal(await collections.logs(db).countDocuments({ userId: account.id, event: 'notes_unreadable' }), 1);
+
+    // The next edit writes the note to a new file and records it.
+    const edited = await push([{ ...a, title: 'A edited', base_version: 1 }], account.token);
+    assert.equal(edited.status, 200);
+    const repaired = await meta(a.id);
+    assert.notEqual(repaired.driveFileId, oldFileOfA);
+    assert.equal(files.get(repaired.driveFileId).title, 'A edited');
+    const again = await json(await request('/notes/pull', 'GET', undefined, account.token));
+    assert.deepEqual(again.rows.map((r: any) => r.id).sort(), [a.id, b.id].sort());
+    assert.equal(again.skipped, 0);
+
+    // Deleting a note whose file is already gone needs no new file.
+    missingFiles.add(repaired.driveFileId);
+    const before = writes;
+    assert.equal((await push([{ ...a, deleted: true, base_version: 2 }], account.token)).status, 200);
+    assert.equal(writes, before);
+    assert.equal((await meta(a.id)).deleted, true);
+
+    // The app folder itself is gone: it is recreated once and the note lands in the new folder.
+    missingFolder = 'test-folder';
+    const c = row({ title: 'C' });
+    assert.equal((await push([c], account.token)).status, 200);
+    assert.equal(foldersEnsured, 1);
+    assert.equal((await collections.googleAccounts(db).findOne({ userId: account.id }))!.driveRootFolderId, 'recreated-folder');
+    assert.equal(await collections.logs(db).countDocuments({ userId: account.id, event: 'drive_folder_recreated' }), 1);
+
+    // Wiping an account must not fail because some files are already gone.
+    missingFiles.add((await meta(b.id)).driveFileId);
+    const wiped = await request('/notes', 'DELETE', undefined, account.token);
+    assert.equal(wiped.status, 200);
+    assert.ok((await json(wiped)).deleted >= 3);
+  });
+
+  await t.test('a revoked Google grant answers 401 google_reauth_required; the same request resumes after sign-in without a second charge', async () => {
+    const account = await user(), first = row({ title: 'Before revoke' });
+    assert.equal((await push([first], account.token)).status, 200);
+    assert.equal((await wallet(account.id)).energy, 15);
+
+    revoked = true;
+    try {
+      const pull = await request('/notes/pull', 'GET', undefined, account.token);
+      assert.equal(pull.status, 401);
+      assert.equal((await json(pull)).error, 'google_reauth_required');
+
+      const requestId = randomUUID(), rows = [row({ title: 'During revoke' })];
+      const denied = await push(rows, account.token, requestId, 'instant');
+      assert.equal(denied.status, 401);
+      assert.equal((await json(denied)).error, 'google_reauth_required');
+      assert.equal(await collections.notes(db).countDocuments({ userId: account.id }), 1); // only the first note exists
+      assert.equal((await wallet(account.id)).energy, 5); // the instant sync was accepted and charged, and is still open
+      assert.equal((await syncOperations(db).findOne({ _id: `${account.id}:${requestId}` }))!.status, 'pending');
+
+      revoked = false; // the user signed in again
+      const resumed = await push(rows, account.token, requestId, 'instant');
+      assert.equal(resumed.status, 200);
+      const body = await json(resumed);
+      assert.deepEqual([body.charged, body.refunded], [10, 0]);
+      assert.equal((await wallet(account.id)).energy, 5); // no second charge
+      assert.equal(await collections.energyLedger(db).countDocuments({ userId: account.id, kind: 'spend' }), 2);
+      assert.equal((await syncOperations(db).findOne({ _id: `${account.id}:${requestId}` }))!.status, 'complete');
+    } finally { revoked = false; }
+  });
+
+  await t.test('Google login falls back to the profile endpoint when the token response has no ID token', async () => {
+    const verifier = { async verifyIdToken() { throw new Error('must not be called without an ID token'); } } as any;
+    const sub = randomUUID(), setup = async () => ({ notesId: 'folder-p' });
+    const tokens = { access_token: 'access', refresh_token: 'refresh', expiry_date: Date.now() + 3600000 };
+    const viaProfile = await completeGoogleLogin(db, verifier, tokens, 'agent', setup as any,
+      async () => ({ sub, email: 'Profile@Example.com', email_verified: true, name: 'P' })) as { user: { id: string; email: string } };
+    assert.equal(viaProfile.user.email, 'profile@example.com');
+    assert.equal((await collections.googleAccounts(db).findOne({ googleAccountId: sub }))!.userId, viaProfile.user.id);
+    assert.deepEqual(await completeGoogleLogin(db, verifier, tokens, 'agent', setup as any, async () => null), { error: 'incomplete_token_response' });
+    assert.deepEqual(await completeGoogleLogin(db, verifier, { ...tokens, access_token: undefined }, 'agent', setup as any, async () => ({})), { error: 'incomplete_token_response' });
+    assert.deepEqual(await completeGoogleLogin(db, verifier, tokens, 'agent', setup as any,
+      async () => ({ sub: randomUUID(), email: 'unverified@example.com', email_verified: false })), { error: 'invalid_id_token' });
+  });
+
+  await t.test('sync operation records expire after 30 days', async () => {
+    const indexes = await db.collection('sync_operations').indexes();
+    const ttl = indexes.find((index) => index.key.createdAt === 1);
+    assert.equal(ttl?.expireAfterSeconds, 30 * 24 * 60 * 60);
   });
 
   await t.test('returning Google login links by subject, reuses the refresh token and repairs missing Drive setup', async () => {

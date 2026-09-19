@@ -267,6 +267,8 @@ export const collections = {
 /** Call once at startup (or via a one-off script) — indexes are not auto-created. */
 export async function ensureIndexes(db: Db) {
   await db.collection("sync_operations").createIndex({ userId: 1, status: 1 });
+  // Records only need to outlive the retries of a request; keep them for 30 days.
+  await db.collection("sync_operations").createIndex({ createdAt: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 });
   await db.collection("oauth_states").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
   await db.collection("operation_locks").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
   await collections.users(db).createIndex({ email: 1 }, { unique: true });

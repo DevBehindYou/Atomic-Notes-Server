@@ -1,4 +1,5 @@
 import { MongoClient, type Db } from 'mongodb';
+import { mongoCommands } from '../lib/perf.js';
 
 const uri = process.env.MONGODB_URI;
 const dbName = process.env.MONGODB_DB_NAME ?? 'atomic_notes';
@@ -9,7 +10,9 @@ if (!uri) throw new Error('MONGODB_URI is not set');
 // a request handler, that would open a fresh connection on every request.
 const client = new MongoClient(uri, {
   maxPoolSize: 10,
+  monitorCommands: true,
 });
+client.on('commandStarted', () => { mongoCommands.started++; });
 
 let connected = false;
 async function ensureConnected() {

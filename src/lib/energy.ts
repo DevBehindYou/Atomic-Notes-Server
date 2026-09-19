@@ -84,6 +84,13 @@ async function getOrInitWallet(db: Db, userId: string): Promise<AtomicUserDoc> {
   return (await col.findOne({ _id: userId }))!;
 }
 
+/** The wallet, created with its welcome gift if missing. One read when it already exists. */
+export const energyWallet = getOrInitWallet;
+
+/** True when the rolling 24 hours since the last daily grant have passed. */
+export const dailyGrantDue = (wallet: AtomicUserDoc, now = new Date()) =>
+  wallet.lastDailyGrantAt === null || wallet.lastDailyGrantAt.getTime() <= now.getTime() - ENERGY.dailyGrantWindowMs;
+
 /** energy_ensure — idempotent wallet init. Safe to call as often as needed. */
 export async function energyEnsure(db: Db, userId: string): Promise<void> {
   await getOrInitWallet(db, userId);

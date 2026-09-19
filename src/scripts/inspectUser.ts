@@ -53,7 +53,8 @@ if (!email) {
       rows: o.results.length, ok: o.results.filter((r) => r.ok).length, createdAt: o.createdAt,
     })));
     console.log('energy ledger (newest first)', ledger.map((l) => ({ kind: l.kind, coins: l.coinsDelta, energy: l.energyDelta, note: l.note, at: l.createdAt })));
-    console.log('recent events', logs.map((l) => `${l.createdAt.toISOString()} ${l.level} ${l.event}`));
+    // notes_pushed carries timings: ms is the whole push, driveMs the part spent waiting for Google.
+    console.log('recent events', logs.map((l) => `${l.createdAt.toISOString()} ${l.level} ${l.event}${l.event === 'notes_pushed' ? ' ' + JSON.stringify(l.meta) : ''}`));
   }
 }
 

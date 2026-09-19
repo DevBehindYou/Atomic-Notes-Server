@@ -4,6 +4,7 @@
   "installCommand": "npm ci",
   "buildCommand": "npm run build",
   "outputDirectory": "public",
+  "regions": ["bom1"],
   "functions": { "api/index.ts": { "maxDuration": 300 } },
   "rewrites": [{ "source": "/api/(.*)", "destination": "/api" }]
 }

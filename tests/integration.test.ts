@@ -6,10 +6,15 @@ import { Hono } from 'hono';
 
 // This suite creates and drops only its own database on a disposable local runner.
 const uri = process.env.MONGODB_URI;
-if (!uri || !/^mongodb:\/\/(127\.0\.0\.1|localhost):\d+(?:[/?]|$)/.test(uri)) {
+// Default: a disposable localhost replica set only. A developer may opt in to a temporary database inside an
+// Atlas cluster: the suite still creates a uniquely named database and drops only that one at the end.
+const localReplicaSet = /^mongodb:\/\/(127\.0\.0\.1|localhost):\d+(?:[/?]|$)/.test(uri ?? '');
+const atlasTempDb = process.env.INTEGRATION_ALLOW_ATLAS_TEMP_DB === 'yes' && /^mongodb\+srv:\/\//.test(uri ?? '');
+if (!uri || !(localReplicaSet || atlasTempDb)) {
   throw new Error('Integration tests require a disposable localhost MongoDB replica set');
 }
-const databaseName = `atomic_test_${randomUUID().replaceAll('-', '')}`;
+// Atlas limits database names to 38 bytes.
+const databaseName = `atomic_test_${randomUUID().replaceAll('-', '').slice(0, 20)}`;
 process.env.MONGODB_DB_NAME = databaseName;
 process.env.ADMIN_API_KEY = 'test-admin-key';
 process.env.TOKEN_ENCRYPTION_KEY = Buffer.alloc(32, 3).toString('base64');
@@ -31,8 +36,11 @@ const { beginSync, recordSyncResult, syncOperations } = await import('../src/lib
 const { saveNoteMetadata } = await import('../src/lib/noteMetadata');
 const { decryptToken } = await import('../src/lib/crypto');
 const { remoteNoteRowSchema } = await import('../src/types/noteWire');
+const { mongoCommands } = await import('../src/lib/perf');
+// Upper bounds on MongoDB commands per one-note operation (set after measuring; lower them when optimizing).
+const BUDGET: Record<string, number> = { firstPush: 29, freePush: 18, pullOneRow: 4, pullNothing: 2, count: 2 };
 
-test('Server contracts with a real MongoDB replica set and a fake Drive adapter', { timeout: 120000 }, async (t) => {
+test('Server contracts with a real MongoDB replica set and a fake Drive adapter', { timeout: Number(process.env.INTEGRATION_TIMEOUT_MS ?? 120000) }, async (t) => {
   const db = await getDb();
   t.after(async () => {
     try { assert.equal(db.databaseName, databaseName); await db.dropDatabase(); }
@@ -296,7 +304,10 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
 
   await t.test('pull pages by sequence cursor and reports deletions after the cursor', async () => {
     const account = await user(), notes = Array.from({ length: 12 }, () => row());
-    assert.equal((await push(notes, account.token)).status, 200);
+    const pushed = await push(notes, account.token);
+    assert.equal(pushed.status, 200);
+    // Each written row reports its sequence, consecutive within one push: the App uses this to skip its own echo.
+    assert.deepEqual((await json(pushed)).results.map((r: any) => r.seq), Array.from({ length: 12 }, (_, i) => i + 1));
     const pull = async (query = '') => json(await request(`/notes/pull${query}`, 'GET', undefined, account.token));
     const first = await pull();
     assert.equal(first.rows.length, 10); assert.equal(first.hasMore, true);
@@ -408,6 +419,26 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
     const wiped = await request('/notes', 'DELETE', undefined, account.token);
     assert.equal(wiped.status, 200);
     assert.ok((await json(wiped)).deleted >= 3);
+  });
+
+  await t.test('round trips: one-note sync operations stay within a small database command budget', async () => {
+    // Each command is a network round trip in production; a function far from Atlas pays ~200 ms for each.
+    const commands = async (work: () => Response | Promise<Response>) => {
+      const before = mongoCommands.started;
+      const response = await work();
+      assert.ok(response.status < 300, `status ${response.status}`);
+      return mongoCommands.started - before;
+    };
+    const account = await user();
+    const counts = {
+      firstPush: await commands(() => push([row()], account.token)),         // charges, grants the daily energy, creates a note
+      freePush: await commands(() => push([row()], account.token)),          // inside the paid hour
+      pullOneRow: await commands(() => request('/notes/pull?after=1', 'GET', undefined, account.token)),  // one note to read from Drive
+      pullNothing: await commands(() => request('/notes/pull?after=99', 'GET', undefined, account.token)),
+      count: await commands(() => request('/notes/count', 'GET', undefined, account.token)),
+    };
+    console.log('MONGO COMMANDS PER OPERATION', JSON.stringify(counts));
+    for (const [name, limit] of Object.entries(BUDGET)) assert.ok((counts as Record<string, number>)[name] <= limit, `${name}: ${(counts as Record<string, number>)[name]} commands, budget ${limit}`);
   });
 
   await t.test('a revoked Google grant answers 401 google_reauth_required; the same request resumes after sign-in without a second charge', async () => {

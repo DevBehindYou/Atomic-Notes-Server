@@ -1,5 +1,6 @@
 import { saveNoteMetadata } from '../lib/noteMetadata.js';
-import { beginSync, finishSync, findSync, recordSyncResult, settleAbandonedSyncs, type SyncOperation } from '../lib/syncOperation.js';
+import { finishSync, findSync, openSync, recordSyncResult, settleAbandonedSyncs, type SyncOperation } from '../lib/syncOperation.js';
+import { currentPerf, runWithPerf, timedDrive } from '../lib/perf.js';
 import { ENERGY } from '../lib/energy.js';
 import { acquireOperationLock } from '../lib/operationLock.js';
 import { NOTE_LIMITS, refineNoteContent, remoteNoteRowSchema } from '../types/noteWire.js';
@@ -26,15 +27,22 @@ export type DriveAdapter = {
 };
 
 export function createNotesRoute(drive: DriveAdapter = { createNoteFile, updateNoteFile, deleteNoteFile, getNoteFileContent }) {
-  const { createNoteFile, updateNoteFile, deleteNoteFile, getNoteFileContent } = drive;
-  const ensureFolders = drive.ensureAppFolders ?? ensureAppFolders;
+  // Every Drive call is timed so a slow request shows how much of it was Google (see Server-Timing).
+  const createNoteFile = (...args: Parameters<DriveAdapter['createNoteFile']>) => timedDrive(() => drive.createNoteFile(...args));
+  const updateNoteFile = (...args: Parameters<DriveAdapter['updateNoteFile']>) => timedDrive(() => drive.updateNoteFile(...args));
+  const deleteNoteFile = (...args: Parameters<DriveAdapter['deleteNoteFile']>) => timedDrive(() => drive.deleteNoteFile(...args));
+  const getNoteFileContent = (...args: Parameters<DriveAdapter['getNoteFileContent']>) => timedDrive(() => drive.getNoteFileContent(...args));
+  const ensureFolders = (...args: Parameters<typeof ensureAppFolders>) => timedDrive(() => (drive.ensureAppFolders ?? ensureAppFolders)(...args));
   const notesRoute = new Hono();
   notesRoute.use('*', requireAuth);
-  notesRoute.use('*', async (c, next) => {
-    // Keep pulls and writes consistent with one another across Vercel instances.
-    const release = await acquireOperationLock(await getDb(), `notes:${c.get('userId')}`, 15000);
+  notesRoute.use('*', (c, next) => runWithPerf(async () => {
+    const started = performance.now();
+    // Writes are serialized per user across Vercel instances. Reads take no lock: pull reads the sequence
+    // counter first and only rows up to it, and each sequence is committed before the next is issued.
+    const readOnly = ['GET', 'HEAD'].includes(c.req.method);
+    const release = readOnly ? null : await acquireOperationLock(await getDb(), `notes:${c.get('userId')}`, 15000);
     try {
-      if (!['GET', 'HEAD'].includes(c.req.method) && !c.req.path.endsWith('/push')) {
+      if (!readOnly && !c.req.path.endsWith('/push')) {
         const db = await getDb();
         // The lock is ours, so an operation still pending belongs to a request that died.
         await settleAbandonedSyncs(db, c.get('userId'));
@@ -46,8 +54,10 @@ export function createNotesRoute(drive: DriveAdapter = { createNoteFile, updateN
         }
       }
       await next();
-    } finally { await release(); }
-  });
+    } finally { if (release) await release(); }
+    const perf = currentPerf();
+    c.header('Server-Timing', `total;dur=${Math.round(performance.now() - started)}, drive;dur=${Math.round(perf?.driveMs ?? 0)};desc="${perf?.driveCalls ?? 0} calls"`);
+  }));
 
   // Field names match the real `note` table (kind/title/body/items/pinned/
   // enc_v/payload) — content (title/body/items, or payload when encrypted)
@@ -264,6 +274,7 @@ export function createNotesRoute(drive: DriveAdapter = { createNoteFile, updateN
   }
 
   notesRoute.post('/push', async (c) => {
+    const pushStarted = performance.now();
     const userId = c.get('userId') as string;
     const db = await getDb();
     const { rows, requestId, mode } = z.object({ rows: z.array(remoteNoteRowSchema).max(20), requestId: z.string().uuid(), mode: z.enum(['standard', 'instant']).default('standard') }).parse(await c.req.json());
@@ -276,24 +287,17 @@ export function createNotesRoute(drive: DriveAdapter = { createNoteFile, updateN
     const recorded = await findSync(db, userId, requestId, rows, mode);
     if (recorded?.status === 'complete') return pushResponse(c, recorded);
 
-    // Reject collisions before touching Drive; also scope every write below.
-    const collision = await collections.notes(db).findOne({
-      _id: { $in: rows.map((row) => row.id) }, userId: { $ne: userId },
-    });
-    if (collision) return c.json({ error: 'note_id_conflict' }, 409);
-
-    const existingDocs = await collections
-      .notes(db)
-      .find({ userId, _id: { $in: rows.map((r) => r.id) } })
-      .toArray();
-    const existingById = new Map(existingDocs.map((d) => [d._id, d]));
+    // One lookup serves both: reject another account's IDs before touching Drive, and find this user's existing notes.
+    const found = await collections.notes(db).find({ _id: { $in: rows.map((r) => r.id) } }).toArray();
+    if (found.some((doc) => doc.userId !== userId)) return c.json({ error: 'note_id_conflict' }, 409);
+    const existingById = new Map(found.map((d) => [d._id, d]));
 
     const newActiveCount = rows.filter((r) => (!existingById.has(r.id) || existingById.get(r.id)!.deleted) && !r.deleted).length;
     const limitError = await enforceNoteLimit(db, userId, newActiveCount);
     if (limitError) return c.json(limitError, 409);
 
     const { accessToken, refreshToken, driveFolderId } = await getLiveGoogleTokens(db, userId);
-    const operation = recorded ?? await beginSync(db, userId, requestId, rows, mode);
+    const operation = recorded ?? await openSync(db, userId, requestId, rows, mode);
     const decided = new Set(operation.results.map((result) => result.id));
 
     // Files and folders the user deleted in Drive are recreated instead of failing every later push.
@@ -393,7 +397,11 @@ export function createNotesRoute(drive: DriveAdapter = { createNoteFile, updateN
     }
     const completed = await finishSync(db, operation);
 
-    await logEvent(db, 'notes_pushed', { userId, meta: { count: rows.length, failed: completed.results.filter((r) => !r.ok).length } });
+    // ms is the whole handler; driveMs is the part spent waiting for Google.
+    await logEvent(db, 'notes_pushed', { userId, meta: {
+      count: rows.length, failed: completed.results.filter((r) => !r.ok).length,
+      ms: Math.round(performance.now() - pushStarted), driveMs: Math.round(currentPerf()?.driveMs ?? 0), driveCalls: currentPerf()?.driveCalls ?? 0,
+    } });
     return pushResponse(c, completed);
   });
 
@@ -405,22 +413,25 @@ export function createNotesRoute(drive: DriveAdapter = { createNoteFile, updateN
     const after = afterValue === undefined ? null : z.coerce.number().int().nonnegative().parse(afterValue);
     const encOnly = c.req.query('encOnly') === 'true';
 
-    const filter: Record<string, unknown> = { userId };
-    if (after !== null) filter.syncSequence = { $gt: after };
-    else if (since) {
-      // Retain compatibility with older App requests that omit a timezone.
-      const parsed = new Date(since);
-      if (!Number.isFinite(parsed.getTime())) return c.json({ error: 'invalid_since' }, 400);
-      filter.updatedAt = { $gte: parsed };
-    }
+    if (after === null && since && !Number.isFinite(new Date(since).getTime())) return c.json({ error: 'invalid_since' }, 400);
+
+    // Read the sequence counter first and take only rows up to it. A sequence is committed before the next
+    // one is issued (writes are serialized per user), so everything at or below the counter is visible and
+    // a write that lands during this request is picked up by the next pull. No lock is needed.
+    const cursor = new Date().toISOString();
+    const latest = await db.collection<{ _id: string; value: number }>('sync_counters').findOne({ _id: userId });
+    const upper = latest?.value ?? 0;
+    if (upper === 0 || (after !== null && after >= upper)) return c.json({ rows: [], cursor, nextCursor: upper, hasMore: false });
+
+    const filter: Record<string, unknown> = { userId, syncSequence: { ...(after !== null ? { $gt: after } : {}), $lte: upper } };
+    // Retain compatibility with older App requests that omit a timezone.
+    if (after === null && since) filter.updatedAt = { $gte: new Date(since) };
     if (encOnly) filter.encV = 0;
 
-    const cursor = new Date().toISOString();
     const metaRows = await collections.notes(db).find(filter).sort({ syncSequence: 1, _id: 1 }).limit(11).toArray();
     const hasMore = metaRows.length > 10;
     if (hasMore) metaRows.pop();
-    const latest = await db.collection<{ _id: string; value: number }>('sync_counters').findOne({ _id: userId });
-    const nextCursor = hasMore ? metaRows[metaRows.length - 1].syncSequence ?? 0 : latest?.value ?? 0;
+    const nextCursor = hasMore ? metaRows[metaRows.length - 1].syncSequence ?? 0 : upper;
     if (metaRows.length === 0) return c.json({ rows: [], cursor, nextCursor, hasMore: false });
 
     // Tombstones carry no content — skip the Drive read for those, the row

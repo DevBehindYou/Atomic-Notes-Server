@@ -211,6 +211,17 @@ Both sides must ship together.
   session and shows the sign-in screen. A push that was already accepted stays
   open; after signing in, retrying the same `requestId` resumes it without a
   second charge.
+- **Reads take no lock.** `GET /notes/pull` reads the per-user sequence counter first and only rows up to
+  it. Writes are serialized per user and each sequence commits before the next is issued, so everything at or
+  below the counter is visible and later writes arrive in the next pull. Each written row in a push result
+  carries its `seq`; the App uses it to skip re-reading its own rows from Drive when they are the next
+  sequences after its cursor.
+- **Timing:** every `/api/notes` response has a `Server-Timing` header (`total`, `drive` with the call
+  count), and each `notes_pushed` log event stores `ms`, `driveMs` and `driveCalls`
+  (`npm run db:inspect -- <email>` prints them). An integration test caps the MongoDB commands per
+  one-note operation, because every command is a network round trip. **Run the Vercel function in the same
+  region as Atlas** (`vercel.json` sets `bom1` for a Mumbai cluster); a function in another continent pays
+  about 200 ms per command.
 - **Per-user lock:** every `/api/notes` request holds a Mongo lock for that
   user (lease 600 s, longer than the 300 s function limit). Requests wait up
   to 15 s for it, then fail with 409 `operation_in_progress`.

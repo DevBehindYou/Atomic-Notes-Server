@@ -3,8 +3,10 @@ import type { Db } from 'mongodb';
 import { collections } from '../db/collections.js';
 import { withTransaction } from '../db/mongo.js';
 import { ENERGY, EnergyError, dailyGrantDue, energyGrantDaily, energyWallet } from './energy.js';
+import { httpError } from './httpError.js';
 
-export type SyncResult = { id: string; ok: boolean; updated_at?: string; error?: string; version?: number; seq?: number };
+/** [unchanged]: the note already held exactly this content, so nothing was written to Drive. */
+export type SyncResult = { id: string; ok: boolean; updated_at?: string; error?: string; version?: number; seq?: number; unchanged?: boolean };
 export type SyncOperation = {
   _id: string; userId: string; fingerprint: string; mode: 'standard' | 'instant'; rowIds: string[];
   charged: number; createdAt: Date; previousStandardAt: Date | null;
@@ -52,9 +54,13 @@ export async function openSync(db: Db, userId: string, requestId: string, rows: 
   }
   const fingerprint = fingerprintOf(rows, mode);
   const now = new Date();
-  const free = mode === 'standard' && wallet.lastStandardSyncAt !== null &&
-    now.getTime() - wallet.lastStandardSyncAt.getTime() < ENERGY.standardSyncFreeWindowMs;
-  if (rows.length === 0 || free) {
+  // A standard sync may start once per interval, by the Server's clock. Nothing is recorded or charged when it
+  // is refused; instant sync is the way to send changes sooner.
+  if (mode === 'standard' && wallet.lastStandardSyncAt !== null) {
+    const waitMs = wallet.lastStandardSyncAt.getTime() + ENERGY.standardSyncIntervalMs - now.getTime();
+    if (waitMs > 0) throw httpError('sync_cooldown', 429, { retry_after_seconds: Math.ceil(waitMs / 1000) });
+  }
+  if (rows.length === 0) {
     // Nothing to charge, so there is nothing to keep atomic with the operation record.
     const operation: SyncOperation = { _id: operationId(userId, requestId), userId, fingerprint, mode, rowIds: rows.map((row) => row.id),
       charged: 0, createdAt: now, previousStandardAt: wallet.lastStandardSyncAt, status: 'pending', results: [], refunded: 0 };

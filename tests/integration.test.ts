@@ -22,7 +22,7 @@ process.env.TOKEN_ENCRYPTION_KEY = Buffer.alloc(32, 3).toString('base64');
 const { getDb, closeDb, withTransaction } = await import('../src/db/mongo');
 const { collections, ensureIndexes } = await import('../src/db/collections');
 const { createSession, verifySession } = await import('../src/lib/session');
-const { energyEnsure, energyConvert, energyGrantDaily, energySpendStandard } = await import('../src/lib/energy');
+const { energyEnsure, energyConvert, energyGrantDaily } = await import('../src/lib/energy');
 const { encryptToken } = await import('../src/lib/crypto');
 const { createNotesRoute } = await import('../src/routes/notes');
 const { registerErrorHandler } = await import('../src/middleware/errorHandler');
@@ -38,7 +38,7 @@ const { decryptToken } = await import('../src/lib/crypto');
 const { remoteNoteRowSchema } = await import('../src/types/noteWire');
 const { mongoCommands } = await import('../src/lib/perf');
 // Upper bounds on MongoDB commands per one-note operation (set after measuring; lower them when optimizing).
-const BUDGET: Record<string, number> = { firstPush: 29, freePush: 18, pullOneRow: 4, pullNothing: 2, count: 2 };
+const BUDGET: Record<string, number> = { firstPush: 29, instantPush: 29, cooldownPush: 10, pullOneRow: 4, pullNothing: 2, count: 2 };
 
 test('Server contracts with a real MongoDB replica set and a fake Drive adapter', { timeout: Number(process.env.INTEGRATION_TIMEOUT_MS ?? 120000) }, async (t) => {
   const db = await getDb();
@@ -50,7 +50,7 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
   await ensureIndexes(db);
 
   const files = new Map<string, any>();
-  let writes = 0, failDelete = false, failTitle = '', activeReads = 0, peakReads = 0;
+  let writes = 0, failDelete = false, failTitle = '', activeReads = 0, peakReads = 0, activeWrites = 0, peakWrites = 0;
   // Simulates what a user can do in Drive outside the app.
   const missingFiles = new Set<string>(); let missingFolder = '', foldersEnsured = 0;
   const notFound = () => Object.assign(new Error('File not found'), { code: 404 });
@@ -62,12 +62,14 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
       if (revoked) throw revokedError();
       if (missingFolder && parent === missingFolder) throw notFound();
       if ((content as any).title === failTitle && failTitle) throw new Error('simulated_drive_failure');
+      peakWrites = Math.max(peakWrites, ++activeWrites); await delay(5); activeWrites--;
       writes++; const id = randomUUID(); files.set(id, structuredClone(content)); return { id, headRevisionId: '1' };
     },
     async updateNoteFile(_a: string, _r: string, id: string, content: object) {
       if (revoked) throw revokedError();
       if (missingFiles.has(id)) throw notFound();
       if ((content as any).title === failTitle && failTitle) throw new Error('simulated_drive_failure');
+      peakWrites = Math.max(peakWrites, ++activeWrites); await delay(5); activeWrites--;
       writes++; files.set(id, structuredClone(content)); return { id, headRevisionId: '2' };
     },
     async deleteNoteFile(_a: string, _r: string, id: string) {
@@ -106,7 +108,13 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
   const row = (overrides = {}) => ({ id: randomUUID(), kind: 'text', title: 'Keep title', body: 'Keep body', items: [],
     pinned: false, deleted: false, created_at: new Date().toISOString(),
     enc_v: 0, payload: null, ...overrides });
-  const push = (rows: object[], token = owner.token, requestId = randomUUID(), mode = 'standard') => request('/notes/push', 'POST', { rows, requestId, mode }, token);
+  // Opens the hourly standard sync again and tops up energy, for tests about something other than billing.
+  const refill = (id: string) => collections.atomicUsers(db).updateOne({ _id: id }, { $set: { lastStandardSyncAt: null, energy: 100 } });
+  // The owner is used for many pushes in a row, so its cooldown is reset each time; billing tests use their own accounts.
+  const push = async (rows: object[], token = owner.token, requestId = randomUUID(), mode = 'standard') => {
+    if (token === owner.token && mode === 'standard') await refill(owner.id);
+    return request('/notes/push', 'POST', { rows, requestId, mode }, token);
+  };
 
   await t.test('owner isolation, partial updates and failed pushes', async () => {
     const original = row(); assert.equal((await push([original])).status, 200);
@@ -115,7 +123,7 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
     assert.equal(writes, before);
     assert.equal((await collections.notes(db).findOne({ _id: original.id }))!.userId, owner.id);
     assert.equal((await push([original, original])).status, 400);
-    assert.equal((await request(`/notes/${original.id}`, 'PATCH', { pinned: true, base_version: 1 }, owner.token)).status, 200);
+    assert.equal((await push([{ ...original, pinned: true, base_version: 1 }])).status, 200);
     const metadata = (await collections.notes(db).findOne({ _id: original.id }))!;
     assert.equal(files.get(metadata.driveFileId).body, 'Keep body');
     assert.equal(files.get(metadata.driveFileId).title, 'Keep title');
@@ -157,15 +165,11 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
     await Promise.all([energyGrantDaily(db, walletUser.id), energyGrantDaily(db, walletUser.id)]);
     assert.equal((await collections.atomicUsers(db).findOne({ _id: walletUser.id }))!.energy, 60);
     assert.equal(await collections.energyLedger(db).countDocuments({ userId: walletUser.id, kind: 'daily_grant' }), 1);
-    assert.equal(await energySpendStandard(db, walletUser.id), 5);
-    const paid = (await collections.atomicUsers(db).findOne({ _id: walletUser.id }))!;
-    assert.equal(await energySpendStandard(db, walletUser.id), 0);
-    assert.deepEqual((await collections.atomicUsers(db).findOne({ _id: walletUser.id }))!.lastStandardSyncAt, paid.lastStandardSyncAt);
     await assert.rejects(withTransaction(async (session) => {
       await collections.atomicUsers(db).updateOne({ _id: walletUser.id }, { $inc: { energy: 9 } }, { session });
       throw new Error('rollback_fixture');
     }), /rollback_fixture/);
-    assert.equal((await collections.atomicUsers(db).findOne({ _id: walletUser.id }))!.energy, 55);
+    assert.equal((await collections.atomicUsers(db).findOne({ _id: walletUser.id }))!.energy, 60);
   });
 
   await t.test('Community notification CRUD hides targeted and expired messages', async () => {
@@ -275,6 +279,7 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
     const account = await user(), note = row();
     const created = await json(await push([note], account.token));
     assert.equal(created.results[0].version, 1);
+    await refill(account.id);
     const stale = await push([{ ...note, title: 'stale', base_version: 0 }], account.token);
     assert.equal(stale.status, 502);
     const staleBody = await json(stale);
@@ -282,24 +287,23 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
     assert.equal(staleBody.results[0].version, 1);
     const stored = (await collections.notes(db).findOne({ _id: note.id }))!;
     assert.equal(files.get(stored.driveFileId).title, 'Keep title');
+    await refill(account.id);
     const fresh = await json(await push([{ ...note, title: 'fresh', base_version: 1 }], account.token));
     assert.equal(fresh.results[0].version, 2);
     assert.equal(files.get(stored.driveFileId).title, 'fresh');
   });
 
-  await t.test('direct PATCH requires the edited version and refuses deleted or invalid notes', async () => {
+  await t.test('single-note REST writes are closed: notes are written through push, where sync is charged', async () => {
     const account = await user(), note = row();
     assert.equal((await push([note], account.token)).status, 200);
-    const patch = (body: object) => request(`/notes/${note.id}`, 'PATCH', body, account.token);
-    assert.equal((await patch({ pinned: true })).status, 400);
-    const conflict = await patch({ pinned: true, base_version: 0 });
-    assert.equal(conflict.status, 409);
-    assert.equal((await json(conflict)).version, 1);
-    assert.equal((await patch({ pinned: true, base_version: 1 })).status, 200);
-    assert.equal((await patch({ body: 'x'.repeat(131073), base_version: 2 })).status, 400);
-    assert.equal((await patch({ encV: 1, base_version: 2 })).status, 400);
-    assert.equal((await push([{ ...note, deleted: true, base_version: 2 }], account.token)).status, 200);
-    assert.equal((await patch({ pinned: false, base_version: 3 })).status, 404);
+    const before = writes;
+    for (const [path, method, body] of [['/notes', 'POST', row()], [`/notes/${note.id}`, 'PATCH', { pinned: true, base_version: 1 }]] as const) {
+      const closed = await request(path, method, body, account.token);
+      assert.equal(closed.status, 410);
+      assert.equal((await json(closed)).error, 'use_push');
+    }
+    assert.equal(writes, before);
+    assert.equal((await collections.notes(db).findOne({ _id: note.id }))!.pinned, false);
   });
 
   await t.test('pull pages by sequence cursor and reports deletions after the cursor', async () => {
@@ -316,9 +320,13 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
     assert.deepEqual([...first.rows, ...second.rows].map((r: any) => r.id), notes.map((n) => n.id));
     const third = await pull(`?after=${second.nextCursor}`);
     assert.deepEqual([third.rows.length, third.hasMore, third.nextCursor], [0, false, second.nextCursor]);
+    await refill(account.id);
     assert.equal((await push([{ ...notes[0], deleted: true, base_version: 1 }], account.token)).status, 200);
     const fourth = await pull(`?after=${third.nextCursor}`);
     assert.deepEqual(fourth.rows.map((r: any) => [r.id, r.deleted]), [[notes[0].id, true]]);
+    // A deleted note keeps its content (its Drive file is only in the trash) so a Recycle Bin can restore it.
+    assert.equal(fourth.rows[0].title, 'Keep title');
+    assert.equal(fourth.rows[0].body, 'Keep body');
   });
 
   await t.test('concurrent creates cannot exceed the note quota', async () => {
@@ -390,6 +398,7 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
     assert.equal(await collections.logs(db).countDocuments({ userId: account.id, event: 'notes_unreadable' }), 1);
 
     // The next edit writes the note to a new file and records it.
+    await refill(account.id);
     const edited = await push([{ ...a, title: 'A edited', base_version: 1 }], account.token);
     assert.equal(edited.status, 200);
     const repaired = await meta(a.id);
@@ -402,6 +411,7 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
     // Deleting a note whose file is already gone needs no new file.
     missingFiles.add(repaired.driveFileId);
     const before = writes;
+    await refill(account.id);
     assert.equal((await push([{ ...a, deleted: true, base_version: 2 }], account.token)).status, 200);
     assert.equal(writes, before);
     assert.equal((await meta(a.id)).deleted, true);
@@ -409,6 +419,7 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
     // The app folder itself is gone: it is recreated once and the note lands in the new folder.
     missingFolder = 'test-folder';
     const c = row({ title: 'C' });
+    await refill(account.id);
     assert.equal((await push([c], account.token)).status, 200);
     assert.equal(foldersEnsured, 1);
     assert.equal((await collections.googleAccounts(db).findOne({ userId: account.id }))!.driveRootFolderId, 'recreated-folder');
@@ -419,6 +430,15 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
     const wiped = await request('/notes', 'DELETE', undefined, account.token);
     assert.equal(wiped.status, 200);
     assert.ok((await json(wiped)).deleted >= 3);
+    // A cloud wipe leaves no tombstones: a pull must not tell any device to delete its own local notes.
+    assert.equal(await collections.notes(db).countDocuments({ userId: account.id }), 0);
+    const afterWipe = await json(await request('/notes/pull?after=0', 'GET', undefined, account.token));
+    assert.deepEqual(afterWipe.rows, []);
+    // The account keeps working: a device that still holds a note writes it again with its old version.
+    await refill(account.id);
+    const restored = await push([{ ...c, base_version: 1 }], account.token);
+    assert.equal(restored.status, 200);
+    assert.equal((await collections.notes(db).findOne({ _id: c.id }))!.localVersion, 1);
   });
 
   await t.test('round trips: one-note sync operations stay within a small database command budget', async () => {
@@ -432,11 +452,14 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
     const account = await user();
     const counts = {
       firstPush: await commands(() => push([row()], account.token)),         // charges, grants the daily energy, creates a note
-      freePush: await commands(() => push([row()], account.token)),          // inside the paid hour
+      instantPush: await commands(() => push([row()], account.token, randomUUID(), 'instant')), // charges 10
       pullOneRow: await commands(() => request('/notes/pull?after=1', 'GET', undefined, account.token)),  // one note to read from Drive
       pullNothing: await commands(() => request('/notes/pull?after=99', 'GET', undefined, account.token)),
       count: await commands(() => request('/notes/count', 'GET', undefined, account.token)),
     };
+    const refusedFrom = mongoCommands.started;
+    assert.equal((await push([row()], account.token)).status, 429); // inside the hour: refused before any charge
+    (counts as Record<string, number>).cooldownPush = mongoCommands.started - refusedFrom;
     console.log('MONGO COMMANDS PER OPERATION', JSON.stringify(counts));
     for (const [name, limit] of Object.entries(BUDGET)) assert.ok((counts as Record<string, number>)[name] <= limit, `${name}: ${(counts as Record<string, number>)[name]} commands, budget ${limit}`);
   });
@@ -469,6 +492,160 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
       assert.equal(await collections.energyLedger(db).countDocuments({ userId: account.id, kind: 'spend' }), 2);
       assert.equal((await syncOperations(db).findOne({ _id: `${account.id}:${requestId}` }))!.status, 'complete');
     } finally { revoked = false; }
+  });
+
+  await t.test('a standard sync starts once per hour; instant sync is always open; a refused sync costs nothing', async () => {
+    const account = await user(), first = row(), second = row(), third = row(), requestId = randomUUID();
+    const paid = await push([first], account.token, requestId);
+    assert.equal(paid.status, 200); assert.equal((await json(paid)).charged, 5);
+    const energy = (await wallet(account.id)).energy, before = writes;
+    const operations = await syncOperations(db).countDocuments({ userId: account.id });
+
+    const refused = await push([second], account.token);
+    assert.equal(refused.status, 429);
+    const body = await json(refused);
+    assert.equal(body.error, 'sync_cooldown');
+    assert.ok(body.retry_after_seconds > 3500 && body.retry_after_seconds <= 3600, `retry after ${body.retry_after_seconds}`);
+    assert.equal(refused.headers.get('retry-after'), String(body.retry_after_seconds));
+    assert.equal(writes, before);
+    assert.equal((await wallet(account.id)).energy, energy);
+    assert.equal(await syncOperations(db).countDocuments({ userId: account.id }), operations);
+    assert.equal(await collections.notes(db).countDocuments({ _id: second.id }), 0);
+    // A retry of the request that already finished is answered from its record, not refused.
+    assert.equal((await push([first], account.token, requestId)).status, 200);
+
+    // Instant sync is open at any time, costs 10, and leaves the standard clock alone.
+    const standardAt = (await wallet(account.id)).lastStandardSyncAt;
+    const instant = await push([second], account.token, randomUUID(), 'instant');
+    assert.equal(instant.status, 200); assert.equal((await json(instant)).charged, 10);
+    assert.equal((await wallet(account.id)).energy, energy - 10);
+    assert.deepEqual((await wallet(account.id)).lastStandardSyncAt, standardAt);
+
+    // The hour is counted by the Server's clock: after it, a standard sync is charged again.
+    await collections.atomicUsers(db).updateOne({ _id: account.id }, { $set: { lastStandardSyncAt: new Date(Date.now() - 61 * 60 * 1000), energy: 50 } });
+    const later = await push([third], account.token);
+    assert.equal(later.status, 200); assert.equal((await json(later)).charged, 5);
+  });
+
+  await t.test('a note that already holds exactly what a push sends is not written to Drive again', async () => {
+    const account = await user(), note = row();
+    const created = await json(await push([note], account.token));
+    assert.equal(created.results[0].unchanged, undefined);
+    assert.ok((await collections.notes(db).findOne({ _id: note.id }))!.contentHash);
+
+    await refill(account.id);
+    const before = writes;
+    const same = await push([{ ...note, base_version: 1 }], account.token);
+    assert.equal(same.status, 200);
+    const [result] = (await json(same)).results;
+    assert.deepEqual([result.ok, result.unchanged, result.version], [true, true, 1]);
+    assert.equal(writes, before);
+    assert.equal((await collections.notes(db).findOne({ _id: note.id }))!.localVersion, 1);
+
+    // A real edit, and a batch that mixes an unchanged note, an edit and a new note.
+    await refill(account.id);
+    const edited = await json(await push([{ ...note, title: 'changed', base_version: 1 }], account.token));
+    assert.equal(edited.results[0].version, 2); assert.equal(writes, before + 1);
+    const fresh = row();
+    await refill(account.id);
+    const mixed = await json(await push([{ ...note, title: 'changed', base_version: 2 }, fresh], account.token));
+    assert.deepEqual(mixed.results.map((r: any) => [r.ok, r.unchanged ?? false]), [[true, true], [true, false]]);
+    assert.equal(writes, before + 2);
+    // Pinning is content too, and deleting an already deleted note changes nothing.
+    await refill(account.id);
+    assert.equal((await json(await push([{ ...note, title: 'changed', pinned: true, base_version: 2 }], account.token))).results[0].version, 3);
+    await refill(account.id);
+    assert.equal((await push([{ ...note, title: 'changed', pinned: true, deleted: true, base_version: 3 }], account.token)).status, 200);
+    await refill(account.id);
+    const gone = (await json(await push([{ ...note, title: 'changed', pinned: true, deleted: true, base_version: 4 }], account.token))).results[0];
+    assert.deepEqual([gone.ok, gone.unchanged], [true, true]);
+  });
+
+  await t.test('a batch is written to Drive in parallel and committed in the order it was sent', async () => {
+    const account = await user(), notes = Array.from({ length: 12 }, (_, i) => row({ title: `n${i}` }));
+    peakWrites = 0;
+    const response = await push(notes, account.token);
+    assert.equal(response.status, 200);
+    const body = await json(response);
+    assert.deepEqual(body.results.map((r: any) => r.id), notes.map((n) => n.id));
+    assert.deepEqual(body.results.map((r: any) => r.seq), Array.from({ length: 12 }, (_, i) => i + 1));
+    assert.ok(peakWrites > 1 && peakWrites <= 4, `peak writes in flight: ${peakWrites}`);
+  });
+
+  await t.test('one push carries up to 50 notes', async () => {
+    const account = await user();
+    await collections.atomicUsers(db).updateOne({ _id: account.id }, { $set: { noteLimit: 50, energy: 100 } });
+    assert.equal((await push(Array.from({ length: 51 }, () => row()), account.token)).status, 400);
+    const response = await push(Array.from({ length: 50 }, () => row()), account.token);
+    assert.equal(response.status, 200);
+    assert.equal(await collections.notes(db).countDocuments({ userId: account.id, deleted: false }), 50);
+  });
+
+  await t.test('a batch may delete a note and add one at the limit, but a stale delete frees no room', async () => {
+    const account = await user(), a = row(), b = row(), c = row(), d = row();
+    await collections.atomicUsers(db).updateOne({ _id: account.id }, { $set: { noteLimit: 2 } });
+    assert.equal((await push([a, b], account.token)).status, 200);
+    await refill(account.id);
+    const full = await push([c], account.token);
+    assert.equal(full.status, 409); assert.equal((await json(full)).error, 'note_limit_reached');
+    await refill(account.id);
+    assert.equal((await push([{ ...a, deleted: true, base_version: 1 }, c], account.token)).status, 200);
+    assert.equal(await collections.notes(db).countDocuments({ userId: account.id, deleted: false }), 2);
+    // The delete of b names an old version, so it conflicts and removes nothing: adding d must not fit.
+    await refill(account.id);
+    assert.equal((await push([{ ...b, deleted: true, base_version: 0 }, d], account.token)).status, 409);
+    assert.equal(await collections.notes(db).countDocuments({ userId: account.id, deleted: false }), 2);
+  });
+
+  await t.test('note capacity is bought with coins, 10 notes at a time, up to 50, and a repeated call charges once', async () => {
+    const account = await user();
+    const upgrade = (from: number) => request('/energy/note-limit', 'POST', { from_limit: from }, account.token);
+    const poor = await upgrade(20);
+    assert.equal(poor.status, 409); assert.equal((await json(poor)).error, 'insufficient_coins');
+    assert.equal((await wallet(account.id)).noteLimit, 20);
+
+    await collections.atomicUsers(db).updateOne({ _id: account.id }, { $set: { coins: 30 } });
+    const first = await json(await upgrade(20));
+    assert.deepEqual([first.wallet.note_limit, first.wallet.coins], [30, 20]);
+    // The same call again, as after a lost response: the purchase went through, so nothing more is charged.
+    const repeat = await upgrade(20);
+    assert.equal(repeat.status, 200);
+    assert.deepEqual([(await json(repeat)).wallet.coins, (await wallet(account.id)).noteLimit], [20, 30]);
+    // A caller that is ahead of the Server is refused.
+    assert.equal((await json(await upgrade(40))).error, 'invalid_amount');
+
+    assert.deepEqual([(await json(await upgrade(30))).wallet.note_limit, (await json(await upgrade(40))).wallet.note_limit], [40, 50]);
+    const capped = await upgrade(50);
+    assert.equal(capped.status, 409); assert.equal((await json(capped)).error, 'note_limit_ceiling');
+    assert.deepEqual([(await wallet(account.id)).coins, (await wallet(account.id)).noteLimit], [0, 50]);
+    const purchases = await collections.energyLedger(db).find({ userId: account.id, kind: 'purchase' }).toArray();
+    assert.deepEqual(purchases.map((p) => p.coinsDelta), [-10, -10, -10]);
+
+    // The Server publishes the numbers it enforces, and a pushed batch obeys the new limit.
+    const state = await json(await request('/energy', 'GET', undefined, account.token));
+    assert.deepEqual([state.wallet.note_limit, state.limits.note_limit_ceiling, state.limits.note_limit_step_cost_coins], [50, 50, 10]);
+    await refill(account.id);
+    assert.equal((await push(Array.from({ length: 30 }, () => row()), account.token)).status, 200);
+  });
+
+  await t.test('a client can neither spend nor refund energy itself', async () => {
+    const account = await user();
+    for (const path of ['/energy/spend', '/energy/spend-standard', '/energy/refund']) {
+      const response = await request(path, 'POST', { amount: 1, reason: 'x' }, account.token);
+      assert.equal(response.status, 410, path);
+    }
+  });
+
+  await t.test('deleted notes expire after 30 days, and only the newest 5 sessions stay valid', async () => {
+    const ttl = (await collections.notes(db).indexes()).find((index) => index.name === 'tombstone_ttl');
+    assert.equal(ttl?.expireAfterSeconds, 30 * 24 * 60 * 60);
+    assert.deepEqual(ttl?.partialFilterExpression, { deleted: true });
+
+    const account = await user(), tokens = [account.token];
+    for (let i = 0; i < 7; i++) { await delay(3); tokens.push(await createSession(db, account.id)); }
+    assert.equal(await collections.sessions(db).countDocuments({ userId: account.id, revoked: false }), 5);
+    assert.ok(await verifySession(db, tokens[tokens.length - 1]));
+    assert.equal(await verifySession(db, tokens[0]), null);
   });
 
   await t.test('Google login falls back to the profile endpoint when the token response has no ID token', async () => {

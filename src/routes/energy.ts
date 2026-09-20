@@ -3,14 +3,14 @@ import { z } from 'zod';
 import { getDb } from '../db/mongo.js';
 import { collections, type AtomicUserDoc } from '../db/collections.js';
 import { requireAuth } from '../middleware/auth.js';
-import { logEvent } from '../lib/logs.js';
 import {
+  ENERGY,
   EnergyError,
+  NOTE_LIMIT,
   energyEnsure,
   energyGrantDaily,
   energyConvert,
-  energySpend,
-  energySpendStandard,
+  energyUpgradeNoteLimit,
   energyHistory,
 } from '../lib/energy.js';
 
@@ -38,9 +38,23 @@ function walletToWire(w: AtomicUserDoc | null) {
         coins: w.coins,
         energy: w.energy,
         energy_cap: w.energyCap,
+        note_limit: w.noteLimit,
         last_daily_grant_at: w.lastDailyGrantAt ? w.lastDailyGrantAt.toISOString() : null,
       }
     : null;
+}
+
+/** The prices and ceilings, so the App shows what the Server enforces instead of a copy that can drift. */
+function limitsToWire() {
+  return {
+    note_limit_free: NOTE_LIMIT.free,
+    note_limit_step: NOTE_LIMIT.step,
+    note_limit_ceiling: NOTE_LIMIT.ceiling,
+    note_limit_step_cost_coins: NOTE_LIMIT.stepCostCoins,
+    sync_standard_cost: ENERGY.syncStandardCost,
+    sync_instant_cost: ENERGY.syncInstantCost,
+    sync_standard_interval_seconds: ENERGY.standardSyncIntervalMs / 1000,
+  };
 }
 
 function historyToWire(rows: Awaited<ReturnType<typeof energyHistory>>) {
@@ -65,7 +79,7 @@ energy.get('/', async (c) => {
 
   const wallet = await collections.atomicUsers(db).findOne({ _id: userId });
   const history = await energyHistory(db, userId);
-  return c.json({ wallet: walletToWire(wallet), history: historyToWire(history) });
+  return c.json({ wallet: walletToWire(wallet), history: historyToWire(history), limits: limitsToWire() });
 });
 
 const convertSchema = z.object({ coins: z.number().int().positive() });
@@ -82,34 +96,26 @@ energy.post('/convert', async (c) => {
   return c.json({ wallet: walletToWire(wallet) });
 });
 
-const spendSchema = z.object({ amount: z.number().int().positive(), reason: z.string().min(1).max(200) });
-energy.post('/spend', async (c) => {
+/**
+ * POST /energy/note-limit — buys the next 10 notes of capacity with coins, up to the ceiling.
+ * [from_limit] is the limit the App showed, which makes a repeated call harmless.
+ */
+const noteLimitSchema = z.object({ from_limit: z.number().int().nonnegative() });
+energy.post('/note-limit', async (c) => {
   const userId = c.get('userId') as string;
   const db = await getDb();
-  const { amount, reason } = spendSchema.parse(await c.req.json());
+  const { from_limit } = noteLimitSchema.parse(await c.req.json());
   try {
-    await energySpend(db, userId, amount, reason);
-  } catch (e) {
-    if (e instanceof EnergyError) await logEvent(db, 'energy_spend_failed', { userId, level: 'warn', meta: { code: e.code, amount, reason } });
-    return handleEnergyError(c, e);
-  }
-  const wallet = await collections.atomicUsers(db).findOne({ _id: userId });
-  return c.json({ wallet: walletToWire(wallet) });
-});
-
-/** POST /energy/spend-standard — used by the notes sync path, not called directly by the UI. */
-energy.post('/spend-standard', async (c) => {
-  const userId = c.get('userId') as string;
-  const db = await getDb();
-  try {
-    const charged = await energySpendStandard(db, userId);
-    const wallet = await collections.atomicUsers(db).findOne({ _id: userId });
-    return c.json({ charged, wallet: walletToWire(wallet) });
+    const wallet = await energyUpgradeNoteLimit(db, userId, from_limit);
+    return c.json({ wallet: walletToWire(wallet), limits: limitsToWire() });
   } catch (e) {
     return handleEnergyError(c, e);
   }
 });
 
+// Charging is done by the Server when a sync runs. A client can neither spend nor refund energy itself.
+energy.post('/spend', (c) => c.json({ error: 'client_spending_disabled' }, 410));
+energy.post('/spend-standard', (c) => c.json({ error: 'client_spending_disabled' }, 410));
 // Refunds are performed only by the Server when a recorded sync fails.
 energy.post('/refund', (c) => c.json({ error: 'client_refunds_disabled' }, 410));
 

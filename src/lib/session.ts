@@ -26,7 +26,19 @@ export async function createSession(db: Db, userId: string, userAgent?: string |
     revoked: false,
     userAgent: userAgent ?? null,
   });
+  await limitActiveSessions(db, userId);
   return rawToken;
+}
+
+/**
+ * Every sign-in makes a session, and one that is never signed out stays valid for a week. Keeping the newest
+ * few means a phone, a tablet and a spare all work, while a token that was left behind stops working.
+ */
+export const MAX_ACTIVE_SESSIONS = 5;
+async function limitActiveSessions(db: Db, userId: string) {
+  const active = await collections.sessions(db).find({ userId, revoked: false }, { projection: { _id: 1 } })
+    .sort({ createdAt: -1 }).skip(MAX_ACTIVE_SESSIONS).toArray();
+  if (active.length > 0) await collections.sessions(db).updateMany({ _id: { $in: active.map((s) => s._id) } }, { $set: { revoked: true } });
 }
 
 /** Returns the session's userId if the raw token is valid, not revoked, and unexpired — else null. */

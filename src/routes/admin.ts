@@ -8,6 +8,7 @@ import { requireAdmin } from '../middleware/adminAuth.js';
 import { computeControllerStats } from '../lib/adminStats.js';
 import { logEvent } from '../lib/logs.js';
 import { getEnvIssues } from '../lib/env.js';
+import { NOTE_LIMIT } from '../lib/energy.js';
 
 const admin = new Hono();
 admin.use('*', requireAdmin);
@@ -123,7 +124,7 @@ admin.post('/energy', async (c) => {
         $set: { coins: newCoins, energy: newEnergy },
         $setOnInsert: {
           username: '',
-          noteLimit: 20,
+          noteLimit: NOTE_LIMIT.free,
           energyCap: 120,
           lastDailyGrantAt: null,
           lastStandardSyncAt: null,

@@ -87,29 +87,53 @@ Full field-by-field mapping is in the comments above each schema in
 
 ## The Energy economy
 
-The live app gates cloud sync behind a small in-app economy: instant sync
-costs 10 energy, standard (hourly/background) sync costs 5 (free once within
-the same hour), energy regenerates 20/day, and coins convert to energy at
-40:1 — all enforced server-side via Postgres `SECURITY DEFINER` RPCs so the
-client can't just edit its own balance.
+The app gates cloud sync behind a small in-app economy: instant sync costs
+10 energy and is always open, automatic (standard) sync costs 5 and may start
+once an hour, energy regenerates 20/day, and coins convert to energy at 40:1
+— all enforced server-side so the client can't just edit its own balance.
+Coins also buy note capacity: 10 coins per 10 notes, from 20 up to a ceiling
+of 50 (`NOTE_LIMIT` in `src/lib/energy.ts`; `GET /api/energy` returns these numbers
+as `limits` so the App shows what is enforced).
 
-`src/lib/energy.ts` ports the five RPCs (`energy_ensure`, `energy_grant_daily`,
-`energy_convert`, `energy_spend`, `energy_spend_standard`, `energy_refund`) to
-MongoDB, using multi-document transactions (wallet update + ledger insert,
-atomically) in place of what a single Postgres function got for free. Exposed
-over HTTP at `/api/energy/*` (`src/routes/energy.ts`).
+`src/lib/energy.ts` keeps the wallet operations (ensure, daily grant, convert,
+note-limit purchase, refund) on MongoDB, using multi-document transactions
+(wallet update + ledger insert, atomically) in place of what a single
+Postgres function got for free. Exposed over HTTP at `/api/energy/*`
+(`src/routes/energy.ts`).
 
 **Sync is charged by the Server, not the client.** `POST /api/notes/push`
 (`src/lib/syncOperation.ts`) charges the wallet when it accepts a request:
-instant costs 10, standard costs 5 and is free inside the hour after the last
-paid standard sync, an empty batch is free. The request is recorded in
+instant costs 10 and is always open; standard costs 5 and starts **at most once
+per hour by the Server's clock**: inside the hour it answers
+`429 sync_cooldown` with `retry_after_seconds` (and a `Retry-After` header), records
+and charges nothing, and the App keeps the changes for the next window or for
+instant sync. An empty batch is free. The request is recorded in
 `sync_operations` under the client's `requestId`; if **no** note in the batch
-was delivered the Server refunds it, once, and restores the free window. A
-retry of a finished request returns the recorded outcome without charging or
-writing again. `POST /api/energy/refund` no longer exists (410): clients
-cannot ask for refunds. `/energy/spend` and `/energy/spend-standard` remain
-as primitives; `POST`/`PATCH` on `/api/notes` are only accepted inside a paid
-standard-sync window and require the `base_version` being edited.
+was delivered the Server refunds it, once, and restores the previous standard
+clock. A retry of a finished request returns the recorded outcome without
+charging or writing again, even inside the hour. `POST /api/energy/refund`,
+`/energy/spend` and `/energy/spend-standard` answer 410: a client can neither spend
+nor refund. `POST`/`PATCH` on `/api/notes` answer 410 `use_push`: notes are written only
+through `/push`, where sync is charged and rate limited.
+
+**Note capacity.** `POST /api/energy/note-limit` with `{ from_limit }` buys the next
+10 notes for 10 coins. `from_limit` is the limit the App showed, so a repeated
+call after a lost response charges once. Errors: `insufficient_coins`,
+`note_limit_ceiling` (at 50), `invalid_amount` (the caller is ahead of the Server).
+`POST /notes/push` enforces the limit: a batch may delete a note and add one at
+the limit, but only deletions that will really happen make room.
+
+**Only edited notes reach Drive.** Each note stores a `contentHash` of what was last
+written. A pushed row with the same fingerprint and deleted flag returns
+`ok` with `unchanged: true` and the stored `version`, and no Drive call is made.
+Rows that do need Drive are written 4 at a time (each write is about 1.7 s of
+waiting) and committed to MongoDB in the order they were sent, so sequence
+numbers stay consecutive.
+
+**Housekeeping.** A deleted note's row (tombstone) expires after 30 days
+(TTL index `tombstone_ttl`; run `npm run db:indexes` after deploying), matching
+the Drive trash. Each account keeps its newest 5 sessions; older ones are
+revoked at sign-in.
 
 MongoDB transactions **require a replica set** — Atlas gives you one by
 default (including the free tier); a bare standalone `mongod` does not
@@ -191,7 +215,7 @@ Controller panel.
 Both sides must ship together.
 
 - **Push:** `POST /api/notes/push` with `{ requestId (UUID), mode: "standard" | "instant", rows: [...] }`,
-  at most 20 rows. Each row carries `base_version` (the version the App last
+  at most 50 rows. Each row carries `base_version` (the version the App last
   saw, 0 for a new note). A row whose `base_version` is not the stored version
   fails with `note_conflict` (and the current `version`); nothing is
   overwritten. Any failed row makes the response HTTP 502 with per-row
@@ -204,13 +228,15 @@ Both sides must ship together.
   its note metadata.
 - **Pull:** `GET /api/notes/pull?after=<cursor>` returns ten rows ordered by a
   per-user monotonic `syncSequence`, plus `nextCursor` and `hasMore`. Deleted
-  notes stay as tombstones so other devices learn about them.
+  notes stay as tombstones so other devices learn about them. A cloud wipe (`DELETE /api/notes`) is different: it removes the rows too and leaves no tombstones, so no device deletes its local notes.
 - **Revoked or expired Google grant:** when Google refuses the stored refresh
   token (the user revoked the app, or seven days passed in *Testing*), the
   request answers 401 `google_reauth_required`. The App treats a 401 as an ended
   session and shows the sign-in screen. A push that was already accepted stays
   open; after signing in, retrying the same `requestId` resumes it without a
   second charge.
+- **Deleted notes keep their content for the Recycle Bin.** A pull sends a tombstone's content read from its
+  trashed Drive file; a deletion whose file is gone still arrives, without content.
 - **Reads take no lock.** `GET /notes/pull` reads the per-user sequence counter first and only rows up to
   it. Writes are serialized per user and each sequence commits before the next is issued, so everything at or
   below the counter is visible and later writes arrive in the next pull. Each written row in a push result

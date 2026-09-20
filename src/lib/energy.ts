@@ -30,13 +30,20 @@ export const ENERGY = {
   syncStandardCost: 5,
   syncInstantCost: 10,
   defaultEnergyCap: 120,
-  standardSyncFreeWindowMs: 60 * 60 * 1000, // 1 hour
+  /** A standard sync may start at most once per interval, by the Server's clock. Instant sync has no interval. */
+  standardSyncIntervalMs: 60 * 60 * 1000, // 1 hour
   dailyGrantWindowMs: 24 * 60 * 60 * 1000, // 24 hours
 } as const;
 
+/**
+ * How many notes an account may hold. Every account starts at [free]. Each step of [step] notes costs
+ * [stepCostCoins] coins, and no purchase goes past [ceiling]: 50 is the most anyone can have.
+ */
+export const NOTE_LIMIT = { free: 20, step: 10, ceiling: 50, stepCostCoins: 10 } as const;
+
 export class EnergyError extends Error {
   readonly status = 409;
-  code: 'insufficient_coins' | 'insufficient_energy' | 'energy_cap_exceeded' | 'invalid_amount';
+  code: 'insufficient_coins' | 'insufficient_energy' | 'energy_cap_exceeded' | 'invalid_amount' | 'note_limit_ceiling';
   constructor(code: EnergyError['code']) {
     super(code);
     this.code = code;
@@ -51,7 +58,7 @@ async function getOrInitWallet(db: Db, userId: string): Promise<AtomicUserDoc> {
   const fresh: AtomicUserDoc = {
     _id: userId,
     username: '',
-    noteLimit: 20,
+    noteLimit: NOTE_LIMIT.free,
     coins: 5, // welcome gift — new wallets only, confirmed against the real SQL (006_energy.sql's energy_ensure)
     energy: 0,
     energyCap: ENERGY.defaultEnergyCap,
@@ -189,79 +196,41 @@ export async function energyConvert(db: Db, userId: string, coins: number): Prom
   });
 }
 
-/** energy_spend — generic spend, used directly for instant sync (cost 10). */
-export async function energySpend(db: Db, userId: string, amount: number, reason: string): Promise<void> {
-  if (!Number.isInteger(amount) || amount <= 0) throw new EnergyError('invalid_amount');
-  await getOrInitWallet(db, userId);
-
-  await withTransaction(async (session) => {
-    const col = collections.atomicUsers(db);
-    const updated = await col.findOneAndUpdate(
-      { _id: userId, energy: { $gte: amount } },
-      { $inc: { energy: -amount } },
-      { returnDocument: 'after', session },
-    );
-    if (!updated) throw new EnergyError('insufficient_energy');
-
-    await writeLedger(db, session, {
-      userId,
-      kind: 'spend',
-      coinsDelta: 0,
-      energyDelta: -amount,
-      resultingCoins: updated.coins,
-      resultingEnergy: updated.energy,
-      note: reason,
-    });
-  });
-}
-
 /**
- * energy_spend_standard — background/hourly sync. Free within the same
- * rolling hour as the last standard-sync charge, otherwise costs 5. Returns
- * the amount actually charged (0 or 5), matching the live RPC's return value
- * so the caller (routes/notes.ts's syncNow-equivalent) can refund on failure.
+ * Buys the next step of note capacity with coins. [fromLimit] is the limit the caller saw, so the call is
+ * safe to repeat: when the limit has already moved past it, the purchase went through and the wallet is
+ * returned unchanged instead of charging a second time.
  */
-export async function energySpendStandard(db: Db, userId: string): Promise<number> {
+export async function energyUpgradeNoteLimit(db: Db, userId: string, fromLimit: number): Promise<AtomicUserDoc> {
+  if (!Number.isInteger(fromLimit) || fromLimit < 0) throw new EnergyError('invalid_amount');
   await getOrInitWallet(db, userId);
 
   return withTransaction(async (session) => {
     const col = collections.atomicUsers(db);
-    const now = new Date();
     const wallet = (await col.findOne({ _id: userId }, { session }))!;
+    if (wallet.noteLimit > fromLimit) return wallet;
+    if (wallet.noteLimit < fromLimit) throw new EnergyError('invalid_amount');
+    if (wallet.noteLimit >= NOTE_LIMIT.ceiling) throw new EnergyError('note_limit_ceiling');
+    if (wallet.coins < NOTE_LIMIT.stepCostCoins) throw new EnergyError('insufficient_coins');
 
-    const withinFreeWindow =
-      wallet.lastStandardSyncAt !== null &&
-      now.getTime() - wallet.lastStandardSyncAt.getTime() < ENERGY.standardSyncFreeWindowMs;
-
-    if (withinFreeWindow) {
-      // Confirmed against the real SQL (007_hourly_standard_sync.sql): the
-      // free-window branch does NOTHING, not even touching
-      // last_standard_sync_at. This backend's first pass at this function
-      // advanced the timestamp here too, which slides the free window
-      // forward on every call — syncing at least once an hour would then
-      // stay free forever, instead of the cost resuming once the hour
-      // since the last PAID sync elapses. Fixed: only a paid charge (below)
-      // may move the clock.
-      return 0;
-    }
-
+    const next = Math.min(wallet.noteLimit + NOTE_LIMIT.step, NOTE_LIMIT.ceiling);
     const updated = await col.findOneAndUpdate(
-      { _id: userId, energy: { $gte: ENERGY.syncStandardCost } },
-      { $inc: { energy: -ENERGY.syncStandardCost }, $set: { lastStandardSyncAt: now } },
+      { _id: userId, noteLimit: fromLimit, coins: { $gte: NOTE_LIMIT.stepCostCoins } }, // re-check under the transaction
+      { $inc: { coins: -NOTE_LIMIT.stepCostCoins }, $set: { noteLimit: next } },
       { returnDocument: 'after', session },
     );
-    if (!updated) throw new EnergyError('insufficient_energy');
+    if (!updated) throw new EnergyError('insufficient_coins');
 
     await writeLedger(db, session, {
       userId,
-      kind: 'spend',
-      coinsDelta: 0,
-      energyDelta: -ENERGY.syncStandardCost,
+      kind: 'purchase',
+      coinsDelta: -NOTE_LIMIT.stepCostCoins,
+      energyDelta: 0,
       resultingCoins: updated.coins,
       resultingEnergy: updated.energy,
-      note: 'Standard sync (hourly)',
+      note: `Note limit ${fromLimit} to ${next}`,
     });
-    return ENERGY.syncStandardCost;
+    return updated;
   });
 }
 

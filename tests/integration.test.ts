@@ -668,6 +668,14 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
     assert.equal(ttl?.expireAfterSeconds, 30 * 24 * 60 * 60);
   });
 
+  await t.test('log rows expire after 30 days and the energy ledger is kept', async () => {
+    const logTtl = (await collections.logs(db).indexes()).find((index) => index.name === 'logs_ttl');
+    assert.deepEqual(logTtl?.key, { createdAt: 1 });
+    assert.equal(logTtl?.expireAfterSeconds, 30 * 24 * 60 * 60);
+    const ledger = await collections.energyLedger(db).indexes();
+    assert.equal(ledger.some((index) => index.expireAfterSeconds !== undefined), false);
+  });
+
   await t.test('returning Google login links by subject, reuses the refresh token and repairs missing Drive setup', async () => {
     const sub = randomUUID();
     const verifier = { async verifyIdToken({ idToken }: { idToken: string }) { return { getPayload: () => JSON.parse(idToken) }; } } as any;

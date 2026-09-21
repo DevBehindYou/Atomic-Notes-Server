@@ -132,8 +132,9 @@ numbers stay consecutive.
 
 **Housekeeping.** A deleted note's row (tombstone) expires after 30 days
 (TTL index `tombstone_ttl`; run `npm run db:indexes` after deploying), matching
-the Drive trash. Each account keeps its newest 5 sessions; older ones are
-revoked at sign-in.
+the Drive trash. Log rows expire after 30 days (TTL index `logs_ttl`, same
+command); the energy ledger is kept. Each account keeps its newest 5 sessions;
+older ones are revoked at sign-in.
 
 MongoDB transactions **require a replica set** — Atlas gives you one by
 default (including the free tier); a bare standalone `mongod` does not

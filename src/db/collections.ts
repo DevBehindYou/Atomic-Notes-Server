@@ -288,6 +288,10 @@ export async function ensureIndexes(db: Db) {
   await collections.sessions(db).createIndex({ userId: 1, createdAt: -1 });
   await collections.folders(db).createIndex({ userId: 1 });
   await collections.logs(db).createIndex({ userId: 1, createdAt: -1 });
+  // Log rows are for diagnosis, not for keeping: one is written per push, sign-in, wipe and so on, so without
+  // an expiry they are the biggest thing that grows on the free Atlas cluster (512 MB). Balance and purchase
+  // history lives in energy_ledger, which is not touched.
+  await collections.logs(db).createIndex({ createdAt: 1 }, { name: 'logs_ttl', expireAfterSeconds: 30 * 24 * 60 * 60 });
   await collections.notifications(db).createIndex({ status: 1, createdAt: -1 });
   await collections.notifications(db).createIndex({ targetUserId: 1 });
 }

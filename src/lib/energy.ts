@@ -35,11 +35,32 @@ export const ENERGY = {
   dailyGrantWindowMs: 24 * 60 * 60 * 1000, // 24 hours
 } as const;
 
+export interface NoteLimitTier {
+  /** The note limit this tier grants. */
+  readonly limit: number;
+  /** Shown to the user; matches no other identifier. */
+  readonly name: string;
+  /** Coins to reach this tier from the one before it. 0 for the free starting tier. */
+  readonly costCoins: number;
+}
+
 /**
- * How many notes an account may hold. Every account starts at [free]. Each step of [step] notes costs
- * [stepCostCoins] coins, and no purchase goes past [ceiling]: 50 is the most anyone can have.
+ * How many notes an account may hold. Every account starts at the first tier. Each later tier costs
+ * its own [costCoins] to reach from the one before it — not a flat per-step price, since the last
+ * tier is a much bigger jump than the others. No purchase goes past the last tier's [limit].
  */
-export const NOTE_LIMIT = { free: 20, step: 10, ceiling: 50, stepCostCoins: 10 } as const;
+export const NOTE_LIMIT_TIERS: readonly NoteLimitTier[] = [
+  { limit: 20, name: 'Tachyon', costCoins: 0 },
+  { limit: 30, name: 'God', costCoins: 10 },
+  { limit: 40, name: 'Antimatter', costCoins: 10 },
+  { limit: 50, name: 'Monopole', costCoins: 10 },
+  { limit: 100, name: 'Strangelet', costCoins: 50 },
+] as const;
+
+export const NOTE_LIMIT = {
+  free: NOTE_LIMIT_TIERS[0].limit,
+  ceiling: NOTE_LIMIT_TIERS[NOTE_LIMIT_TIERS.length - 1].limit,
+} as const;
 
 export class EnergyError extends Error {
   readonly status = 409;
@@ -210,13 +231,15 @@ export async function energyUpgradeNoteLimit(db: Db, userId: string, fromLimit: 
     const wallet = (await col.findOne({ _id: userId }, { session }))!;
     if (wallet.noteLimit > fromLimit) return wallet;
     if (wallet.noteLimit < fromLimit) throw new EnergyError('invalid_amount');
-    if (wallet.noteLimit >= NOTE_LIMIT.ceiling) throw new EnergyError('note_limit_ceiling');
-    if (wallet.coins < NOTE_LIMIT.stepCostCoins) throw new EnergyError('insufficient_coins');
 
-    const next = Math.min(wallet.noteLimit + NOTE_LIMIT.step, NOTE_LIMIT.ceiling);
+    const tierIndex = NOTE_LIMIT_TIERS.findIndex((t) => t.limit === wallet.noteLimit);
+    const nextTier = tierIndex >= 0 ? NOTE_LIMIT_TIERS[tierIndex + 1] : undefined;
+    if (!nextTier) throw new EnergyError('note_limit_ceiling');
+    if (wallet.coins < nextTier.costCoins) throw new EnergyError('insufficient_coins');
+
     const updated = await col.findOneAndUpdate(
-      { _id: userId, noteLimit: fromLimit, coins: { $gte: NOTE_LIMIT.stepCostCoins } }, // re-check under the transaction
-      { $inc: { coins: -NOTE_LIMIT.stepCostCoins }, $set: { noteLimit: next } },
+      { _id: userId, noteLimit: fromLimit, coins: { $gte: nextTier.costCoins } }, // re-check under the transaction
+      { $inc: { coins: -nextTier.costCoins }, $set: { noteLimit: nextTier.limit } },
       { returnDocument: 'after', session },
     );
     if (!updated) throw new EnergyError('insufficient_coins');
@@ -224,11 +247,11 @@ export async function energyUpgradeNoteLimit(db: Db, userId: string, fromLimit: 
     await writeLedger(db, session, {
       userId,
       kind: 'purchase',
-      coinsDelta: -NOTE_LIMIT.stepCostCoins,
+      coinsDelta: -nextTier.costCoins,
       energyDelta: 0,
       resultingCoins: updated.coins,
       resultingEnergy: updated.energy,
-      note: `Note limit ${fromLimit} to ${next}`,
+      note: `Note limit ${fromLimit} to ${nextTier.limit} (${nextTier.name})`,
     });
     return updated;
   });

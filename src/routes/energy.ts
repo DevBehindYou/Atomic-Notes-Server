@@ -7,6 +7,7 @@ import {
   ENERGY,
   EnergyError,
   NOTE_LIMIT,
+  NOTE_LIMIT_TIERS,
   energyEnsure,
   energyGrantDaily,
   energyConvert,
@@ -48,9 +49,12 @@ function walletToWire(w: AtomicUserDoc | null) {
 function limitsToWire() {
   return {
     note_limit_free: NOTE_LIMIT.free,
-    note_limit_step: NOTE_LIMIT.step,
     note_limit_ceiling: NOTE_LIMIT.ceiling,
-    note_limit_step_cost_coins: NOTE_LIMIT.stepCostCoins,
+    note_limit_tiers: NOTE_LIMIT_TIERS.map((t) => ({
+      limit: t.limit,
+      name: t.name,
+      cost_coins: t.costCoins,
+    })),
     sync_standard_cost: ENERGY.syncStandardCost,
     sync_instant_cost: ENERGY.syncInstantCost,
     sync_standard_interval_seconds: ENERGY.standardSyncIntervalMs / 1000,
@@ -97,7 +101,7 @@ energy.post('/convert', async (c) => {
 });
 
 /**
- * POST /energy/note-limit — buys the next 10 notes of capacity with coins, up to the ceiling.
+ * POST /energy/note-limit — buys the next tier of note capacity with coins, up to the ceiling.
  * [from_limit] is the limit the App showed, which makes a repeated call harmless.
  */
 const noteLimitSchema = z.object({ from_limit: z.number().int().nonnegative() });

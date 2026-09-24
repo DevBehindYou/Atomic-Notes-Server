@@ -64,7 +64,7 @@ export type SessionDoc = z.infer<typeof sessionSchema>;
 //   Supabase column          -> Mongo field
 //   user_id (PK)              -> userId (used as _id here)
 //   username                  -> username
-//   note_limit                -> noteLimit        (default 20 — see note_quota.dart's
+//   note_limit                -> noteLimit        (default 30 — see note_quota.dart's
 //                                                   freeLimit; per-user override is the
 //                                                   hook for a future paid-tier)
 //   coins                     -> coins             (new wallet starts at 5, a one-time
@@ -81,7 +81,7 @@ export type SessionDoc = z.infer<typeof sessionSchema>;
 export const atomicUserSchema = z.object({
   _id: z.string().uuid(), // == userId
   username: z.string().default(''),
-  noteLimit: z.number().int().default(20),
+  noteLimit: z.number().int().default(30),
   coins: z.number().int().default(5), // welcome gift, new wallets only
   energy: z.number().int().default(0),
   energyCap: z.number().int().default(120),

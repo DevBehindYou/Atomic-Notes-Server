@@ -600,23 +600,23 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
   await t.test('note capacity is bought one tier at a time, the last tier costs more, and a repeated call charges once', async () => {
     const account = await user();
     const upgrade = (from: number) => request('/energy/note-limit', 'POST', { from_limit: from }, account.token);
-    const poor = await upgrade(20);
+    const poor = await upgrade(30);
     assert.equal(poor.status, 409); assert.equal((await json(poor)).error, 'insufficient_coins');
-    assert.equal((await wallet(account.id)).noteLimit, 20);
+    assert.equal((await wallet(account.id)).noteLimit, 30);
 
-    // 10 + 10 + 10 + 50: exactly enough for every tier up to the ceiling, nothing left over.
-    await collections.atomicUsers(db).updateOne({ _id: account.id }, { $set: { coins: 80 } });
-    const first = await json(await upgrade(20));
-    assert.deepEqual([first.wallet.note_limit, first.wallet.coins], [30, 70]);
+    // 10 + 20 + 30: exactly enough for every tier up to the ceiling, nothing left over.
+    await collections.atomicUsers(db).updateOne({ _id: account.id }, { $set: { coins: 60 } });
+    const first = await json(await upgrade(30));
+    assert.deepEqual([first.wallet.note_limit, first.wallet.coins], [40, 50]);
     // The same call again, as after a lost response: the purchase went through, so nothing more is charged.
-    const repeat = await upgrade(20);
+    const repeat = await upgrade(30);
     assert.equal(repeat.status, 200);
-    assert.deepEqual([(await json(repeat)).wallet.coins, (await wallet(account.id)).noteLimit], [70, 30]);
+    assert.deepEqual([(await json(repeat)).wallet.coins, (await wallet(account.id)).noteLimit], [50, 40]);
     // A caller that is ahead of the Server is refused.
-    assert.equal((await json(await upgrade(40))).error, 'invalid_amount');
+    assert.equal((await json(await upgrade(50))).error, 'invalid_amount');
 
-    assert.deepEqual([(await json(await upgrade(30))).wallet.note_limit, (await json(await upgrade(40))).wallet.note_limit], [40, 50]);
-    // Strangelet: 50 -> 100 costs 50 coins, not the earlier tiers' 10.
+    assert.equal((await json(await upgrade(40))).wallet.note_limit, 50);
+    // Strangelet: 50 -> 100 costs 30 coins, not the earlier tiers' cheaper prices.
     const strangelet = await json(await upgrade(50));
     assert.deepEqual([strangelet.wallet.note_limit, strangelet.wallet.coins], [100, 0]);
     const capped = await upgrade(100);
@@ -626,7 +626,7 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
       .find({ userId: account.id, kind: 'purchase' })
       .sort({ createdAt: 1 })
       .toArray();
-    assert.deepEqual(purchases.map((p) => p.coinsDelta), [-10, -10, -10, -50]);
+    assert.deepEqual(purchases.map((p) => p.coinsDelta), [-10, -20, -30]);
 
     // The Server publishes the tiers it enforces, and a pushed batch obeys the new limit.
     const state = await json(await request('/energy', 'GET', undefined, account.token));
@@ -634,7 +634,7 @@ test('Server contracts with a real MongoDB replica set and a fake Drive adapter'
     assert.equal(state.limits.note_limit_ceiling, 100);
     assert.deepEqual(
       state.limits.note_limit_tiers.map((t: any) => [t.limit, t.name, t.cost_coins]),
-      [[20, 'Tachyon', 0], [30, 'God', 10], [40, 'Antimatter', 10], [50, 'Monopole', 10], [100, 'Strangelet', 50]],
+      [[30, 'Tachyon', 0], [40, 'Antimatter', 10], [50, 'Monopole', 20], [100, 'Strangelet', 30]],
     );
     await refill(account.id);
     assert.equal((await push(Array.from({ length: 60 }, () => row()), account.token)).status, 200);

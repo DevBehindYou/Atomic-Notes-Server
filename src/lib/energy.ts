@@ -50,11 +50,10 @@ export interface NoteLimitTier {
  * tier is a much bigger jump than the others. No purchase goes past the last tier's [limit].
  */
 export const NOTE_LIMIT_TIERS: readonly NoteLimitTier[] = [
-  { limit: 20, name: 'Tachyon', costCoins: 0 },
-  { limit: 30, name: 'God', costCoins: 10 },
+  { limit: 30, name: 'Tachyon', costCoins: 0 },
   { limit: 40, name: 'Antimatter', costCoins: 10 },
-  { limit: 50, name: 'Monopole', costCoins: 10 },
-  { limit: 100, name: 'Strangelet', costCoins: 50 },
+  { limit: 50, name: 'Monopole', costCoins: 20 },
+  { limit: 100, name: 'Strangelet', costCoins: 30 },
 ] as const;
 
 export const NOTE_LIMIT = {

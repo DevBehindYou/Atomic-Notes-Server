@@ -1,4 +1,4 @@
-import { saveNoteMetadata } from '../lib/noteMetadata.js';
+import { saveNoteMetadata, saveNoteMetadataBatch, type NoteMetadataEntry } from '../lib/noteMetadata.js';
 import { finishSync, findSync, openSync, recordSyncResult, settleAbandonedSyncs, type SyncOperation } from '../lib/syncOperation.js';
 import { currentPerf, runWithPerf, timedDrive } from '../lib/perf.js';
 import { NOTE_LIMIT } from '../lib/energy.js';
@@ -295,34 +295,53 @@ export function createNotesRoute(drive: DriveAdapter = { createNoteFile, updateN
     // the App signs in again and retries the same request, which resumes it.
     if (written.some((w) => !w.ok && isInvalidGrant(w.error))) throw httpError('google_reauth_required', 401);
 
-    // Commit in the order the rows were sent, so their sequence numbers stay consecutive.
+    // Rows whose Drive write failed are recorded now; rows that succeeded are committed
+    // together below, in the order the rows were sent, so their sequence numbers stay
+    // consecutive — one transaction for the whole push instead of one per row, since Drive
+    // writes already overlap but a commit is a network round trip Mongo can't parallelize
+    // the same way.
+    const entries: NoteMetadataEntry[] = [];
     for (let i = 0; i < jobs.length; i++) {
       const { row, existing, hash } = jobs[i];
       const w = written[i];
-      try {
-        if (!w.ok) throw w.error;
-        const setFields = {
-          userId,
-          kind: row.kind,
-          pinned: row.pinned,
-          deleted: row.deleted,
-          encV: row.enc_v,
-          driveFileId: w.driveFileId,
-          driveRevisionId: w.driveRevisionId,
-          contentHash: hash,
-          updatedAt: new Date(),
-          lastSyncedAt: new Date(),
-          syncStatus: 'synced' as const,
-        };
-        // Stores the success result in the same transaction as the metadata.
-        await saveNoteMetadata(db, userId, row.id, setFields, existing ? undefined : {
-          _id: row.id, ...setFields, folderId: null, createdAt: new Date(row.created_at), localVersion: 1,
-        }, operation._id);
-      } catch (e) {
-        // Message only: Google client errors can carry request headers with bearer tokens.
-        console.error('note_write_failed', row.id, e instanceof Error ? e.message : 'unknown');
-        // A no-op when the commit did succeed but its response was lost: stored success wins.
+      if (!w.ok) {
+        console.error('note_write_failed', row.id, w.error instanceof Error ? w.error.message : 'unknown');
         await recordSyncResult(db, operation, { id: row.id, ok: false, error: 'note_write_failed' });
+        continue;
+      }
+      const setFields = {
+        userId,
+        kind: row.kind,
+        pinned: row.pinned,
+        deleted: row.deleted,
+        encV: row.enc_v,
+        driveFileId: w.driveFileId,
+        driveRevisionId: w.driveRevisionId,
+        contentHash: hash,
+        updatedAt: new Date(),
+        lastSyncedAt: new Date(),
+        syncStatus: 'synced' as const,
+      };
+      entries.push(existing
+        ? { id: row.id, fields: setFields, existing }
+        : { id: row.id, fields: setFields, fresh: {
+            _id: row.id, ...setFields, folderId: null, createdAt: new Date(row.created_at), localVersion: 1,
+          } });
+    }
+    if (entries.length > 0) {
+      try {
+        const { notFound } = await saveNoteMetadataBatch(db, userId, entries, operation._id);
+        for (const id of notFound) {
+          console.error('note_write_failed', id, 'note_not_found');
+          await recordSyncResult(db, operation, { id, ok: false, error: 'note_write_failed' });
+        }
+      } catch (e) {
+        // The whole batch's transaction rolled back: nothing in it committed.
+        const message = e instanceof Error ? e.message : 'unknown';
+        for (const entry of entries) {
+          console.error('note_write_failed', entry.id, message);
+          await recordSyncResult(db, operation, { id: entry.id, ok: false, error: 'note_write_failed' });
+        }
       }
     }
     const completed = await finishSync(db, operation);
